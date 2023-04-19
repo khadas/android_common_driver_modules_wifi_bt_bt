@@ -1,0 +1,21 @@
+load("//build/kernel/kleaf:kernel.bzl", "kernel_module")
+
+kernel_module(
+    name = "bt",
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "BUILD.bazel",
+            "**/*.bzl",
+            ".git/**",
+        ],
+    ),
+    outs = [
+        "sdio_bt.ko",
+        "rtk_btusb.ko",
+    ],
+    kernel_build = "//common:amlogic",
+    visibility = [
+        "//common:__pkg__",
+    ],
+)
