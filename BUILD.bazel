@@ -13,8 +13,7 @@ kernel_module(
     outs = [
         "rtk_btusb.ko",
         "sdio_bt.ko",
-        "w1u_bt.ko",
-        "w2_bt.ko",
+        "aml_bt.ko",
     ],
     kernel_build = "//common:amlogic",
     visibility = [
