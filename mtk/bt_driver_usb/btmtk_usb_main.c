@@ -39,14 +39,16 @@
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
 #include <linux/reboot.h>
+#include <linux/interrupt.h>
 
 #include "btmtk_usb_main.h"
-#include "btmtk_usb_fifo.h"
 
 /*============================================================================*/
 /* Local Configuration */
 /*============================================================================*/
-#define VERSION "9.0.2021011501"
+#define VERSION "9.0.2022120802"
+
+#define ALIGN_4(_x_) (((_x_) + 3) & ~3)
 
 /*============================================================================*/
 /* Function Prototype */
@@ -65,14 +67,14 @@ static int btmtk_usb_submit_intr_urb(void);
 static int btmtk_usb_submit_bulk_in_urb(void);
 static int btmtk_usb_send_hci_reset_cmd(void);
 static int btmtk_usb_send_woble_suspend_cmd(void);
-static void btmtk_usb_load_rom_patch_complete(const struct urb *urb);
+static void btmtk_usb_load_rom_patch_complete(struct urb *urb);
 static void btmtk_usb_bulk_in_complete(struct urb *urb);
 static int btmtk_usb_submit_isoc_urb(void);
 static void btmtk_usb_isoc_complete(struct urb *urb);
-static void btmtk_usb_isoc_tx_complete(const struct urb *urb);
+static void btmtk_usb_isoc_tx_complete(struct urb *urb);
 static void btmtk_usb_hci_snoop_print_to_log(void);
 static int btmtk_usb_get_rom_patch_result(void);
-static void btmtk_usb_tx_complete_meta(const struct urb *urb);
+static void btmtk_usb_tx_complete_meta(struct urb *urb);
 static int btmtk_usb_load_rom_patch(void);
 static int btmtk_usb_send_wmt_reset_cmd(void);
 static void btmtk_usb_intr_complete(struct urb *urb);
@@ -146,10 +148,15 @@ static void btmtk_usb_chip_reset_func_init(void);
 static void btmtk_usb_chip_reset_func_deinit(void);
 static void btmtk_usb_stop_acl_traffic(void);
 static void btmtk_usb_stop_traffic(void);
+static void btmtk_usb_unlink_acl_urb(void);
+static void btmtk_usb_unlink_urb(void);
 
-#if SUPPORT_MI_WOBLE
-static int btmtk_usb_send_disable_ble_scan(void);
-#endif
+static int btmtk_usb_L0_probe(struct usb_interface *intf,
+			const struct usb_device_id *id);
+
+typedef int (*usb_probe)(struct usb_interface *intf,
+			const struct usb_device_id *id);
+
 
 /*============================================================================*/
 /* Global Variable */
@@ -191,12 +198,12 @@ static struct btmtk_usb_data *g_data;
 static int probe_counter;
 static u8 need_reset_stack;
 static u8 need_reopen;
-/* bluetooth KPI feature, bperf */
+/* bluetooth KPI feautre, bperf */
 static u8 btmtk_bluetooth_kpi;
 static int leftHciEventSize;
 static int leftACLSize;
-static int btmtk_usb_state = BTMTK_USB_STATE_UNKNOWN;
-static int btmtk_fops_state = BTMTK_FOPS_STATE_UNKNOWN;
+static u8 btmtk_usb_state = BTMTK_USB_STATE_UNKNOWN;
+static u8 btmtk_fops_state = BTMTK_FOPS_STATE_UNKNOWN;
 static unsigned short sco_handle;	/* So far only support one SCO link */
 static DECLARE_WAIT_QUEUE_HEAD(BT_wq);
 static DECLARE_WAIT_QUEUE_HEAD(BT_sco_wq);
@@ -229,9 +236,9 @@ static u8 hci_acl_snoop_buf[HCI_SNOOP_ENTRY_NUM][HCI_SNOOP_BUF_SIZE];
 static u8 hci_acl_snoop_len[HCI_SNOOP_ENTRY_NUM] = { 0 };
 
 static unsigned int hci_acl_snoop_timestamp[HCI_SNOOP_ENTRY_NUM];
-static int hci_cmd_snoop_index = HCI_SNOOP_ENTRY_NUM - 1;
-static int hci_event_snoop_index = HCI_SNOOP_ENTRY_NUM - 1;
-static int hci_acl_snoop_index = HCI_SNOOP_ENTRY_NUM - 1;
+static u32 hci_cmd_snoop_index = HCI_SNOOP_ENTRY_NUM - 1;
+static u32 hci_event_snoop_index = HCI_SNOOP_ENTRY_NUM - 1;
+static u32 hci_acl_snoop_index = HCI_SNOOP_ENTRY_NUM - 1;
 
 static dev_t g_devIDfwlog;
 static char fw_version_str[FW_VERSION_BUF_SIZE];
@@ -257,7 +264,7 @@ static set_gpio_low pf_lowFunc;
 static set_gpio_high pf_highFunc;
 
 /**
- * USB device ID configuration
+ * USB device ID configureation
  */
 static struct usb_device_id btmtk_usb_table[] = {
 #if SUPPORT_MT7662
@@ -278,11 +285,19 @@ static struct usb_device_id btmtk_usb_table[] = {
 	{}
 };
 
+#if (KERNEL_VERSION(5, 6, 0) > LINUX_VERSION_CODE)
 const struct file_operations BT_proc_fops = {
 	.open = btmtk_proc_open,
 	.read = seq_read,
 	.release = single_release,
 };
+#else
+const struct proc_ops BT_proc_fops = {
+	.proc_open = btmtk_proc_open,
+	.proc_read = seq_read,
+	.proc_release = single_release,
+};
+#endif
 
 const struct file_operations BT_fops = {
 	.open = btmtk_usb_fops_open,
@@ -311,66 +326,6 @@ const struct file_operations BT_sco_fops = {
 	.unlocked_ioctl = btmtk_usb_fops_sco_unlocked_ioctl,
 };
 
-#if SUPPORT_MI_WOBLE
-
-#if SUPPORT_MI_WOBLE_BEACON
-unsigned char wifi_addr[BD_ADDRESS_SIZE];
-static char adv_pdu[39] = "0201060FFF8F030A10420C01000000000000EC";
-
-static ssize_t beacon_pdu_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE, "%s\n", adv_pdu);
-}
-
-static ssize_t beacon_pdu_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
-{
-	BTUSB_ERR("%s: set adv_pdu is %s", __func__, buf);
-	snprintf(adv_pdu, sizeof(adv_pdu), "%s", buf);
-
-	return size;
-}
-
-static DEVICE_ATTR(beacon_pdu, 0664, beacon_pdu_show, beacon_pdu_store);
-
-#endif
-
-static char rc_white_list[73]; /* xx:xx:xx:xx:xx:xx; 1 addr has 18 char, 4 addr is 72*/
-
-static ssize_t rclist_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE, "%s\n", rc_white_list);
-}
-
-static ssize_t rclist_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t size)
-{
-	BTUSB_ERR("%s: set rc list is %s", __func__, buf);
-	snprintf(rc_white_list, sizeof(rc_white_list), "%s", buf);
-
-	return size;
-}
-
-static DEVICE_ATTR(rclist, 0644, rclist_show, rclist_store);
-
-/*disable ble scan*/
-static int btmtk_usb_send_disable_ble_scan(void)
-{
-	int ret = -1;
-	u8 disable_ble_scan_cmd[] = { 0x0C, 0x20, 0x02, 0x00, 0x01 };
-	u8 disable_ble_scan_event[] = { 0x0e, 0x04, 0x01, 0x0c, 0x20, 0x00};
-
-	ret = btmtk_usb_send_hci_cmd(disable_ble_scan_cmd, sizeof(disable_ble_scan_cmd),
-		disable_ble_scan_event, sizeof(disable_ble_scan_event));
-	if (ret > 0)
-		ret = 0;
-	else
-		BTUSB_ERR("%s: btmtk_usb_send_hci_cmd return error ret %d", __func__, ret);
-
-	BTUSB_INFO("%s: ret %d", __func__, ret);
-	return ret;
-}
-
-#endif
-
 static inline void __fill_isoc_descriptor(struct urb *urb, int len, int mtu)
 {
 	int i, offset = 0;
@@ -397,11 +352,22 @@ static inline void __fill_isoc_descriptor(struct urb *urb, int len, int mtu)
 #define ___________________________________________________Internal_Functions
 static void *btmtk_usb_kallsyms_lookup_name(const char *name)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
 	void *addr = __symbol_get(name);
-	if(addr)
-		__symbol_put(name);
 
+	if (addr) {
+		__symbol_put(name);
+#ifdef CONFIG_ARM
+#ifdef CONFIG_THUMB2_KERNEL
+		/*set bit 0 in address for thumb mode*/
+		addr |= 1;
+#endif
+#endif
+	}
 	return addr;
+#else
+	return NULL;
+#endif
 }
 
 static int btmtk_skb_enq_fwlog(void *src, u32 len, u8 type, struct sk_buff_head *queue)
@@ -435,19 +401,6 @@ static int btmtk_skb_enq_fwlog(void *src, u32 len, u8 type, struct sk_buff_head 
 	skb_queue_tail(queue, skb_tmp);
 	FWLOG_SPIN_UNLOCK(flags);
 	return 0;
-}
-
-void btmtk_do_gettimeofday(struct timeval *tv)
-{
-#if (KERNEL_VERSION(4, 19, 85) > LINUX_VERSION_CODE)
-	do_gettimeofday(tv);
-#else
-	struct timespec64 ts;
-
-	ktime_get_real_ts64(&ts);
-	tv->tv_sec = ts.tv_sec;
-	tv->tv_usec = ts.tv_nsec/1000;
-#endif
 }
 
 static int btmtk_usb_init_memory(void)
@@ -573,7 +526,8 @@ static int btmtk_usb_allocate_memory(void)
 	}
 
 	if (g_data->o_fwlog_buf == NULL) {
-		g_data->o_fwlog_buf = kzalloc(HCI_MAX_COMMAND_SIZE, GFP_KERNEL);
+		g_data->o_fwlog_buf = kzalloc(HCI_MAX_COMMAND_SIZE + 16,
+			GFP_KERNEL);
 		if (!g_data->o_fwlog_buf) {
 			BTUSB_ERR("%s: alloc memory fail (g_data->o_fwlog_buf)", __func__);
 			return -1;
@@ -637,7 +591,7 @@ static void btmtk_usb_free_memory(void)
 	kfree(g_data->io_buf);
 	g_data->io_buf = NULL;
 
-	kfree(g_data->rom_patch_image);
+	vfree(g_data->rom_patch_image);
 	g_data->rom_patch_image = NULL;
 
 	kfree(g_data->o_usb_buf);
@@ -676,15 +630,14 @@ static void btmtk_usb_initialize_cfg_items(void)
 		return;
 	}
 
-	g_data->bt_cfg.dongle_reset_gpio_pin = 28;
-	g_data->bt_cfg.save_fw_dump_in_kernel = 0;
+	g_data->bt_cfg.dongle_reset_gpio_pin = -1;
 	g_data->bt_cfg.support_dongle_reset = 0;
 	g_data->bt_cfg.support_full_fw_dump = 0;
 	g_data->bt_cfg.support_legacy_woble = 0;
 	g_data->bt_cfg.support_unify_woble = 1;
-	g_data->bt_cfg.unify_woble_type = 1;
+	g_data->bt_cfg.unify_woble_type = 0;
 	g_data->bt_cfg.support_woble_by_eint = 0;
-	g_data->bt_cfg.support_woble_for_bt_disable = 1;
+	g_data->bt_cfg.support_woble_for_bt_disable = 0;
 	g_data->bt_cfg.support_woble_wakelock = 0;
 	g_data->bt_cfg.reset_stack_after_woble = 0;
 	g_data->bt_cfg.sys_log_file_name = NULL;
@@ -697,12 +650,12 @@ static void btmtk_usb_initialize_cfg_items(void)
 	BTUSB_INFO("%s end\n", __func__);
 }
 
-static int btmtk_usb_get_state(void)
+static u8 btmtk_usb_get_state(void)
 {
 	return btmtk_usb_state;
 }
 
-static void btmtk_usb_set_state(int new_state)
+static void btmtk_usb_set_state(u8 new_state)
 {
 	static const char * const state_msg[] = {
 		"UNKNOWN", "INIT", "DISCONNECT", "PROBE", "WORKING", "EARLY_SUSPEND",
@@ -711,17 +664,17 @@ static void btmtk_usb_set_state(int new_state)
 		"RESUME_FW_DUMP", "STANDBY",
 	};
 
-	BTUSB_INFO("%s: %s(%d) -> %s(%d)", __func__, state_msg[btmtk_usb_state],
+	BTUSB_INFO("%s: %s(%u) -> %s(%u)", __func__, state_msg[btmtk_usb_state],
 			btmtk_usb_state, state_msg[new_state], new_state);
 	btmtk_usb_state = new_state;
 }
 
-static int btmtk_fops_get_state(void)
+static u8 btmtk_fops_get_state(void)
 {
 	return btmtk_fops_state;
 }
 
-static void btmtk_fops_set_state(int new_state)
+static void btmtk_fops_set_state(u8 new_state)
 {
 	static const char * const fstate_msg[] = {"UNKNOWN", "INIT", "OPENED", "CLOSING", "CLOSED"};
 
@@ -732,10 +685,17 @@ static void btmtk_fops_set_state(int new_state)
 
 static unsigned int btmtk_usb_hci_snoop_get_microseconds(void)
 {
-	struct timeval now;
+#if (KERNEL_VERSION(4, 19, 85) > LINUX_VERSION_CODE)
+	struct timeval tv = {0};
 
-	btmtk_do_gettimeofday(&now);
-	return now.tv_sec * 1000000 + now.tv_usec;
+	do_gettimeofday(&tv);
+	return tv.tv_sec * 1000000 + tv.tv_usec;
+#else
+	struct timespec64 ts;
+
+	ktime_get_real_ts64(&ts);
+	return ts.tv_sec * 1000000 + ts.tv_nsec/1000;
+#endif
 }
 
 static int btmtk_usb_dispatch_data_bluetooth_kpi(u8 *buf, int len, u8 type)
@@ -787,12 +747,12 @@ static int btmtk_usb_dispatch_acl(u8 *buf, int len)
 			if (ret == 0)
 				wake_up_interruptible(&fw_log_inq);
 			else
-				btmtk_usb_start_reset_dongle_progress();
+				BTUSB_WARN("%s: return %d", __func__, ret);
 			fwlog_fwdump_blocking_warn = 0;
 		} else {
 			if (fwlog_fwdump_blocking_warn == 0) {
 				fwlog_fwdump_blocking_warn = 1;
-				BTUSB_WARN("btmtk_usb fwlog queue size is full(coredump)");
+				BTUSB_WARN("%s: queue size is full", __func__);
 			}
 		}
 	}
@@ -861,9 +821,9 @@ static void btmtk_usb_hci_snoop_save_cmd(u32 len, u8 *buf)
 		memcpy(hci_cmd_snoop_buf[hci_cmd_snoop_index], buf, copy_len & 0xff);
 		hci_cmd_snoop_timestamp[hci_cmd_snoop_index] = btmtk_usb_hci_snoop_get_microseconds();
 
+		if (hci_cmd_snoop_index == 0)
+			hci_cmd_snoop_index = HCI_SNOOP_ENTRY_NUM;
 		hci_cmd_snoop_index--;
-		if (hci_cmd_snoop_index < 0)
-			hci_cmd_snoop_index = HCI_SNOOP_ENTRY_NUM - 1;
 	}
 }
 
@@ -880,9 +840,9 @@ static void btmtk_usb_hci_snoop_save_event(u32 len, u8 *buf)
 		memcpy(hci_event_snoop_buf[hci_event_snoop_index], buf, copy_len);
 		hci_event_snoop_timestamp[hci_event_snoop_index] = btmtk_usb_hci_snoop_get_microseconds();
 
+		if (hci_event_snoop_index == 0)
+			hci_event_snoop_index = HCI_SNOOP_ENTRY_NUM;
 		hci_event_snoop_index--;
-		if (hci_event_snoop_index < 0)
-			hci_event_snoop_index = HCI_SNOOP_ENTRY_NUM - 1;
 	}
 }
 
@@ -898,15 +858,15 @@ static void btmtk_usb_hci_snoop_save_acl(u32 len, u8 *buf)
 		memcpy(hci_acl_snoop_buf[hci_acl_snoop_index], buf, copy_len & 0xff);
 		hci_acl_snoop_timestamp[hci_acl_snoop_index] = btmtk_usb_hci_snoop_get_microseconds();
 
+		if (hci_acl_snoop_index == 0)
+			hci_acl_snoop_index = HCI_SNOOP_ENTRY_NUM;
 		hci_acl_snoop_index--;
-		if (hci_acl_snoop_index < 0)
-			hci_acl_snoop_index = HCI_SNOOP_ENTRY_NUM - 1;
 	}
 }
 
 static void btmtk_usb_hci_snoop_print_to_log(void)
 {
-	int counter, index, j;
+	u32 counter, index, j;
 
 	BTUSB_INFO("HCI Command Dump");
 	BTUSB_INFO("  index(len)(timestamp:us) :HCI Command");
@@ -985,7 +945,7 @@ static int btmtk_usb_send_assert_cmd(void)
 	/*if (ret < 0)*/
 		ret = btmtk_usb_send_assert_cmd_bulk();
 	if (ret < 0) {
-		BTUSB_ERR("%s: send assert cmd fail, trigger hw reset only", __func__);
+		BTUSB_ERR("%s: send assert cmd fail, tigger hw reset only", __func__);
 		btmtk_usb_start_reset_dongle_progress();
 		return ret;
 	}
@@ -993,31 +953,52 @@ static int btmtk_usb_send_assert_cmd(void)
 	/* submit URB since btmtk_usb_send_hci_cmd would stop it */
 	ret = btmtk_usb_start_intr_traffic();
 	if (ret < 0) {
-		BTUSB_ERR("%s: Start interrupt traffic fail, trigger hw reset directly", __func__);
+		BTUSB_ERR("%s: Start interrupt traffic fail, tigger hw reset directly", __func__);
 		btmtk_usb_start_reset_dongle_progress();
 		return ret;
 	}
 
 	ret = btmtk_usb_start_acl_traffic();
 	if (ret < 0) {
-		BTUSB_ERR("%s: Start acl traffic fail, trigger hw reset directly", __func__);
+		BTUSB_ERR("%s: Start acl traffic fail, tigger hw reset directly", __func__);
 		btmtk_usb_start_reset_dongle_progress();
 	}
 	return ret;
 }
 
+static void btmtk_usb_L0_hook_new_probe(usb_probe pFn_Probe)
+{
+	if (pFn_Probe == NULL) {
+		BTUSB_ERR("%s, new probe is NULL", __func__);
+		return;
+	}
+	btmtk_usb_driver.probe = pFn_Probe;
+}
+
+static atomic_t doing_reset = ATOMIC_INIT(0);
+
 void btmtk_usb_toggle_rst_pin(void)
 {
 	struct device_node *node;
 	int rst_pin_num = 0;
+	int cur;
 
 	BTUSB_INFO("%s: begin", __func__);
+
+	cur = atomic_cmpxchg(&doing_reset, BTMTK_RESET_DONE, BTMTK_RESET_DOING);
+	if (cur == BTMTK_RESET_DOING) {
+		BTUSB_INFO("%s: reset in progress, return", __func__);
+		return;
+	}
+
 	if (!pf_resetFunc1 && !pf_resetFunc2 && (!pf_lowFunc || !pf_highFunc))
 		btmtk_usb_chip_reset_func_init();
 
 	/* stop all usb traffic */
-	btmtk_usb_stop_traffic();
-	btmtk_usb_stop_acl_traffic();
+	btmtk_usb_unlink_urb();
+	btmtk_usb_unlink_acl_urb();
+
+	btmtk_usb_L0_hook_new_probe(btmtk_usb_L0_probe);
 
 	if (pf_pdwndFunc) {
 		BTUSB_INFO("%s: Invoke PDWNC_SetBTInResetState(%d)", __func__, 1);
@@ -1106,15 +1087,6 @@ static inline void btmtk_usb_unlock_unsleepable_lock(struct OSAL_UNSLEEPABLE_LOC
 	spin_unlock_irqrestore(&(pUSL->lock), pUSL->flag);
 }
 
-static void btmtk_usb_free_fifo(void)
-{
-	if (g_data && g_data->bt_cfg.save_fw_dump_in_kernel && g_data->bt_fifo) {
-		/*set fifo TASK_SHOULD_STOP bit =1 to stop fifo thread */
-		btmtk_fifo_deinit(g_data->bt_fifo);
-		g_data->bt_fifo = NULL;
-	}
-}
-
 static void btmtk_usb_free_setting_file(void)
 {
 	BTUSB_INFO("%s begin", __func__);
@@ -1133,6 +1105,7 @@ static void btmtk_usb_free_setting_file(void)
 	btmtk_usb_free_fw_cfg_struct(&g_data->woble_setting_radio_on, 1);
 	btmtk_usb_free_fw_cfg_struct(&g_data->woble_setting_radio_on_status_event, 1);
 	btmtk_usb_free_fw_cfg_struct(&g_data->woble_setting_radio_on_comp_event, 1);
+	btmtk_usb_free_fw_cfg_struct(&g_data->woble_setting_wakeup_type, 1);
 
 	g_data->woble_setting_len = 0;
 
@@ -1172,11 +1145,11 @@ static int btmtk_usb_load_fw_cfg_setting(char *block_name, struct fw_cfg_struct 
 	for (i = 0; i < counter; i++) {
 		temp_len = 0;
 		if (index_length == FW_CFG_INX_LEN_2) /* EX: APCF01 */
-			snprintf(search, sizeof(search), "%s%02d:", block_name, i);
+			(void)snprintf(search, sizeof(search), "%s%02d:", block_name, i);
 		else if (index_length == FW_CFG_INX_LEN_3) /* EX: APCF001 */
-			snprintf(search, sizeof(search), "%s%03d:", block_name, i);
+			(void)snprintf(search, sizeof(search), "%s%03d:", block_name, i);
 		else
-			snprintf(search, sizeof(search), "%s:", block_name);
+			(void)snprintf(search, sizeof(search), "%s:", block_name);
 		search_result = strstr((char *)searchcontent, search);
 
 		if (search_result) {
@@ -1192,6 +1165,11 @@ static int btmtk_usb_load_fw_cfg_setting(char *block_name, struct fw_cfg_struct 
 
 			do {
 				search_end = strstr(search_result, ",");
+				if (search_end == NULL) {
+					BTUSB_DBG("%s: search_end is NULL", __func__);
+					break;
+				}
+
 				if (search_end - search_result != CHAR2HEX_SIZE) {
 					BTUSB_ERR("%s: Incorrect Format in %s", __func__, search);
 					break;
@@ -1211,6 +1189,10 @@ static int btmtk_usb_load_fw_cfg_setting(char *block_name, struct fw_cfg_struct 
 					break;
 				}
 				search_result = strstr(search_end, "0x");
+				if (search_result == NULL) {
+					BTUSB_DBG("%s: search_result is NULL", __func__);
+					break;
+				}
 			} while (search_result < next_block || (search_result && next_block == NULL));
 		} else
 			BTUSB_DBG("%s: %s is not found in %d", __func__, search, i);
@@ -1252,7 +1234,7 @@ static bool btmtk_usb_parse_bt_cfg_file(char *item_name,
 	}
 
 	memset(search, 0, sizeof(search));
-	snprintf(search, sizeof(search), "%s", item_name); /* EX: SUPPORT_UNIFY_WOBLE */
+	(void)snprintf(search, sizeof(search), "%s", item_name);
 	p = ptr = strstr((char *)searchcontent, search);
 
 	if (!ptr) {
@@ -1371,15 +1353,6 @@ static bool btmtk_usb_load_bt_cfg_item(struct bt_cfg_struct *bt_cfg_content,
 
 	BTUSB_INFO("%s: bt_cfg_content->dongle_reset_gpio_pin = %d", __func__,
 			bt_cfg_content->dongle_reset_gpio_pin);
-
-	ret = btmtk_usb_parse_bt_cfg_file(BT_SAVE_FW_DUMP_IN_KERNEL, text, searchcontent);
-	if (ret) {
-		btmtk_usb_bt_cfg_item_value_to_bool(text, &bt_cfg_content->save_fw_dump_in_kernel);
-		BTUSB_INFO("%s: bt_cfg_content->save_fw_dump_in_kernel = %d", __func__,
-				bt_cfg_content->save_fw_dump_in_kernel);
-	} else {
-		BTUSB_WARN("%s: search item %s is invalid!", __func__, BT_SAVE_FW_DUMP_IN_KERNEL);
-	}
 
 	ret = btmtk_usb_parse_bt_cfg_file(BT_RESET_DONGLE, text, searchcontent);
 	if (ret) {
@@ -1516,10 +1489,11 @@ static int btmtk_usb_load_code_from_setting_files(char *setting_file_name,
 	BTUSB_INFO("%s: begin setting_file_name = %s", __func__, setting_file_name);
 	err = request_firmware(&fw_entry, setting_file_name, dev);
 	if (err != 0 || fw_entry == NULL) {
-		BTUSB_ERR("%s: request_firmware function fail!! error code = %d, fw_entry = %p",
-				__func__, err, fw_entry);
+		BTUSB_ERR("%s: request_firmware %s fail!! error = %d",
+			__func__, setting_file_name, err);
 		if (fw_entry)
 			release_firmware(fw_entry);
+		err = -2;
 		return err;
 	}
 
@@ -1532,6 +1506,7 @@ static int btmtk_usb_load_code_from_setting_files(char *setting_file_name,
 	if (g_data->setting_file == NULL) {
 		BTUSB_ERR("%s: kzalloc size %zu failed!!", __func__, fw_entry->size);
 		release_firmware(fw_entry);
+		err = -3;
 		return err;
 	}
 
@@ -1549,10 +1524,21 @@ static bool btmtk_usb_load_bt_cfg(char *cfg_name, struct device *dev, struct btm
 {
 	bool err = false;
 	u32 code_len = 0;
+	int ret = 0;
 
-	if (btmtk_usb_load_code_from_setting_files(cfg_name, dev, &code_len)) {
-		BTUSB_ERR("btmtk_usb_load_code_from_setting_files failed!!");
-		return err;
+	ret = btmtk_usb_load_code_from_setting_files(cfg_name, dev, &code_len);
+	if (ret != 0) {
+		BTUSB_ERR("load_code_1 %s failed", cfg_name);
+		if (ret != -2)
+			return false;
+
+		if (btmtk_usb_load_code_from_setting_files(BT_CFG_NAME,
+				dev, &code_len) != 0) {
+			BTUSB_ERR("load_code_2 %s failed!!", BT_CFG_NAME);
+			return false;
+		}
+		(void)snprintf(g_data->bt_cfg_file_name,
+			MAX_BIN_FILE_NAME_LEN, "%s", BT_CFG_NAME);
 	}
 
 	err = btmtk_usb_load_bt_cfg_item(&data->bt_cfg, data->setting_file);
@@ -1681,14 +1667,14 @@ static void btmtk_usb_load_code_from_bin(u8 **image, char *bin_name,
 
 	} else {
 		chip_id = g_data->chip_id;
-		kfree(g_data->rom_patch_image);
+		vfree(g_data->rom_patch_image);
 		g_data->rom_patch_image = NULL;
 		g_data->rom_patch_image_len = 0;
 	}
 
 	do {
 		err = request_firmware(&fw_entry, bin_name, dev);
-		if (err == 0) {
+		if (err >= 0) {
 			break;
 		} else if (retry <= 0) {
 			*image = NULL;
@@ -1699,12 +1685,14 @@ static void btmtk_usb_load_code_from_bin(u8 **image, char *bin_name,
 		msleep(100);
 	} while (retry-- > 0);
 
-	*image = kzalloc(fw_entry->size, GFP_KERNEL);
+	*image = vmalloc(ALIGN_4(fw_entry->size));
 	if (*image == NULL) {
-		BTUSB_ERR("%s: kzalloc failed!! error code = %d", __func__, err);
+		BTUSB_ERR("%s: vmalloc failed!! error code = %d",
+			__func__, err);
 		goto exit;
 	}
 
+	memset(*image, 0, fw_entry->size);
 	memcpy(*image, fw_entry->data, fw_entry->size);
 	*code_len = fw_entry->size;
 
@@ -1720,7 +1708,7 @@ static int btmtk_usb_send_vendor_cfg(void)
 	int ret = 0;
 	int index = 0;
 
-	pr_info("%s", __func__);
+	BTUSB_INFO("%s", __func__);
 
 	for (index = 0; index < VENDOR_CMD_COUNT; index++) {
 		if (g_data->bt_cfg.vendor_cmd[index].content && g_data->bt_cfg.vendor_cmd[index].length) {
@@ -1728,7 +1716,7 @@ static int btmtk_usb_send_vendor_cfg(void)
 							g_data->bt_cfg.vendor_cmd[index].length,
 							NULL, 0);
 			if (ret < 0) {
-				pr_err("%s: Send vendor cmd failed(%d)! Index: %d",
+				BTUSB_ERR("%s: failed(%d)! Index: %d",
 						__func__, ret, index);
 				return ret;
 			}
@@ -1740,6 +1728,7 @@ static int btmtk_usb_send_vendor_cfg(void)
 
 static int btmtk_usb_send_wmt_cfg(void)
 {
+	u8 WMT_CMD0[] = {0x6F, 0xFC, 0x06, 0x01, 0x06, 0x02, 0x00, 0x03, 0x01};
 	int ret = 0;
 	int index = 0;
 
@@ -1756,6 +1745,17 @@ static int btmtk_usb_send_wmt_cfg(void)
 						__func__, ret, index);
 				return ret;
 			}
+		}
+	}
+
+	if (!g_data->bt_cfg.wmt_cmd[0].content) {
+		BTUSB_INFO("%s: use default wmt cmd", __func__);
+		ret = btmtk_usb_send_wmt_cmd(WMT_CMD0, sizeof(WMT_CMD0),
+			NULL, 0, 100, 10, false);
+		if (ret < 0) {
+			BTUSB_ERR("%s: Send default wmt cmd failed(%d)!",
+				__func__, ret);
+			return ret;
 		}
 	}
 
@@ -1806,10 +1806,57 @@ static void btmtk_usb_stop_traffic(void)
 	g_data->isoc_urb_submitted = 0;
 
 	/*need to sleep to ensure when interrupt comes, don't to submit urb in intr_complete function*/
-	msleep(20);
+	if (in_interrupt())
+		mdelay(20);
+	else
+		msleep(20);
 	usb_kill_anchored_urbs(&g_data->intr_in_anchor);
 	usb_kill_anchored_urbs(&g_data->isoc_in_anchor);
 
+	BTUSB_INFO("%s exit", __func__);
+}
+
+static void btmtk_usb_unlink_acl_urb(void)
+{
+	if (g_data->bulk_urb_submitted == 0)
+		return;
+
+	BTUSB_INFO("%s: unlink_acl_in start", __func__);
+	g_data->bulk_urb_submitted = 0;
+	usb_unlink_anchored_urbs(&g_data->bulk_in_anchor);
+	if (usb_anchor_empty(&g_data->bulk_in_anchor))
+		BTUSB_INFO("%s: unlink_acl_in end", __func__);
+	else
+		BTUSB_WARN("%s: unlink_acl_in failed", __func__);
+}
+
+static void btmtk_usb_unlink_urb(void)
+{
+	if ((g_data->interrupt_urb_submitted == 0)
+			&& (g_data->isoc_urb_submitted == 0))
+		return;
+
+	BTUSB_INFO("%s enter", __func__);
+	g_data->interrupt_urb_submitted = 0;
+	g_data->isoc_urb_submitted = 0;
+
+	/* need to sleep to ensure when interrupt comes,
+	 * don't to submit urb in intr_complete function
+	 */
+	if (in_interrupt())
+		mdelay(20);
+	else
+		msleep(20);
+	usb_unlink_anchored_urbs(&g_data->intr_in_anchor);
+	if (usb_anchor_empty(&g_data->intr_in_anchor))
+		BTUSB_INFO("%s: unlink_intr_in end", __func__);
+	else
+		BTUSB_WARN("%s: unlink_intr_in failed", __func__);
+	usb_unlink_anchored_urbs(&g_data->isoc_in_anchor);
+	if (usb_anchor_empty(&g_data->isoc_in_anchor))
+		BTUSB_INFO("%s: unlink_isoc_in end", __func__);
+	else
+		BTUSB_WARN("%s: unlink_isoc_in failed", __func__);
 	BTUSB_INFO("%s exit", __func__);
 }
 
@@ -1826,7 +1873,6 @@ static void btmtk_usb_waker(struct work_struct *work)
 
 static int btmtk_usb_submit_intr_urb(void)
 {
-	struct urb *urb;
 	u8 *buf;
 	unsigned int pipe;
 	int err, size;
@@ -1844,49 +1890,46 @@ static int btmtk_usb_submit_intr_urb(void)
 		return -ENODEV;
 	}
 
-	urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!urb) {
-		BTUSB_ERR("%s: error 2", __func__);
-		return -ENOMEM;
-	}
 	/* size = le16_to_cpu(g_data->intr_ep->wMaxPacketSize); */
 	size = le16_to_cpu(HCI_MAX_EVENT_SIZE);
 	BTUSB_INFO("%s: maximum packet size:%d", __func__, size);
 
-	buf = kzalloc(size, GFP_KERNEL);
-	if (!buf) {
-		usb_free_urb(urb);
-		BTUSB_ERR("%s: error 3", __func__);
-		return -ENOMEM;
+	if (g_data->urb_transfer_buff[RX_INTR_URB] == NULL) {
+		buf = kzalloc(size, GFP_KERNEL);
+		if (!buf) {
+			BTUSB_ERR("%s: error 3", __func__);
+			return -ENOMEM;
+		}
+		g_data->urb_transfer_buff[RX_INTR_URB] = buf;
+	} else {
+		buf = g_data->urb_transfer_buff[RX_INTR_URB];
 	}
 
 	pipe = usb_rcvintpipe(g_data->udev, g_data->intr_ep->bEndpointAddress);
 
-	usb_fill_int_urb(urb, g_data->udev, pipe, buf, size,
+	usb_fill_int_urb(g_data->urb[RX_INTR_URB], g_data->udev, pipe, buf, size,
 			 (usb_complete_t)btmtk_usb_intr_complete, (void *)g_data,
 			 g_data->intr_ep->bInterval);
 
-	urb->transfer_flags |= URB_FREE_BUFFER;
+	g_data->urb[RX_INTR_URB]->transfer_flags |= URB_FREE_BUFFER;
 
-	usb_anchor_urb(urb, &g_data->intr_in_anchor);
+	usb_anchor_urb(g_data->urb[RX_INTR_URB], &g_data->intr_in_anchor);
 
-	err = usb_submit_urb(urb, GFP_KERNEL);
+	err = usb_submit_urb(g_data->urb[RX_INTR_URB], GFP_KERNEL);
 	if (err < 0) {
 		if (err != -EPERM && err != -ENODEV)
-			BTUSB_ERR("%s: urb %p submission failed (%d)", __func__, urb, -err);
-		usb_unanchor_urb(urb);
+			BTUSB_ERR("%s: urb %p submission failed (%d)", __func__, g_data->urb[RX_INTR_URB], -err);
+		usb_unanchor_urb(g_data->urb[RX_INTR_URB]);
 	} else {
 		g_data->interrupt_urb_submitted = 1;
 	}
 
-	usb_free_urb(urb);
 	BTUSB_INFO("%s: end", __func__);
 	return err;
 }
 
 static int btmtk_usb_submit_bulk_in_urb(void)
 {
-	struct urb *urb = NULL;
 	u8 *buf = NULL;
 	unsigned int pipe = 0;
 	int err = 0;
@@ -1905,37 +1948,35 @@ static int btmtk_usb_submit_bulk_in_urb(void)
 		return -ENODEV;
 	}
 
-	urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!urb) {
-		BTUSB_ERR("%s: end error 2", __func__);
-		return -ENOMEM;
+	if (g_data->urb_transfer_buff[RX_BULK_URB] == NULL) {
+		buf = kzalloc(size, GFP_KERNEL);
+		if (!buf) {
+			BTUSB_ERR("%s: end error 3", __func__);
+			return -ENOMEM;
+		}
+		g_data->urb_transfer_buff[RX_BULK_URB] = buf;
+	} else {
+		buf = g_data->urb_transfer_buff[RX_BULK_URB];
 	}
 
-	buf = kzalloc(size, GFP_KERNEL);
-	if (!buf) {
-		usb_free_urb(urb);
-		BTUSB_ERR("%s: end error 3", __func__);
-		return -ENOMEM;
-	}
 	pipe = usb_rcvbulkpipe(g_data->udev, g_data->bulk_rx_ep->bEndpointAddress);
-	usb_fill_bulk_urb(urb, g_data->udev, pipe, buf, size,
+	usb_fill_bulk_urb(g_data->urb[RX_BULK_URB], g_data->udev, pipe, buf, size,
 				btmtk_usb_bulk_in_complete, g_data);
 
-	urb->transfer_flags |= URB_FREE_BUFFER;
+	g_data->urb[RX_BULK_URB]->transfer_flags |= URB_FREE_BUFFER;
 
 	usb_mark_last_busy(g_data->udev);
-	usb_anchor_urb(urb, &g_data->bulk_in_anchor);
+	usb_anchor_urb(g_data->urb[RX_BULK_URB], &g_data->bulk_in_anchor);
 
-	err = usb_submit_urb(urb, GFP_KERNEL);
+	err = usb_submit_urb(g_data->urb[RX_BULK_URB], GFP_KERNEL);
 	if (err < 0) {
 		if (err != -EPERM && err != -ENODEV)
-			BTUSB_ERR("%s: urb %p submission failed (%d)", __func__, urb, -err);
-		usb_unanchor_urb(urb);
+			BTUSB_ERR("%s: urb %p submission failed (%d)", __func__, g_data->urb[RX_BULK_URB], -err);
+		usb_unanchor_urb(g_data->urb[RX_BULK_URB]);
 	} else {
 		g_data->bulk_urb_submitted = 1;
 	}
 
-	usb_free_urb(urb);
 	BTUSB_INFO("%s: end", __func__);
 	return err;
 }
@@ -2259,11 +2300,11 @@ int btmtk_usb_meta_send_data(const u8 *buffer, const unsigned int length)
 
 int btmtk_usb_send_data(const u8 *buffer, const unsigned int length)
 {
-	struct urb *urb = NULL;
 	unsigned int pipe;
 	int err;
 	int send_data_len = length - 1;
 	char *buf = NULL;
+	int tx_retry = META_TX_RETRY;
 
 	if (!g_data->bulk_tx_ep) {
 		BTUSB_ERR("%s: No bulk_tx_ep", __func__);
@@ -2271,19 +2312,22 @@ int btmtk_usb_send_data(const u8 *buffer, const unsigned int length)
 	}
 
 	if (buffer[0] == HCI_ACLDATA_PKT) {
-		while (g_data->meta_tx != 0)
+		while (g_data->meta_tx != 0 && tx_retry-- > 0)
 			usleep_range(400, 500);
 
-		g_data->meta_tx = 1;
-		urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!urb) {
-			BTUSB_ERR("%s: No memory for ACL", __func__);
-			return -ENOMEM;
+		if (tx_retry <= 0) {
+			BTUSB_ERR("%s: fatal error: last send timeout(20s)!",
+				__func__);
+			return -ENODEV;
 		}
-		buf = usb_alloc_coherent(g_data->udev, send_data_len, GFP_KERNEL, &urb->transfer_dma);
+		g_data->meta_tx = 1;
 
-		urb->transfer_buffer = buf;
-		urb->transfer_buffer_length = send_data_len;
+		buf = usb_alloc_coherent(g_data->udev, send_data_len,
+				GFP_KERNEL,
+				&g_data->urb[TX_ACL_URB]->transfer_dma);
+
+		g_data->urb[TX_ACL_URB]->transfer_buffer = buf;
+		g_data->urb[TX_ACL_URB]->transfer_buffer_length = send_data_len;
 
 		if (!buf) {
 			BTUSB_ERR("%s: usb_alloc_coherent error", __func__);
@@ -2295,15 +2339,15 @@ int btmtk_usb_send_data(const u8 *buffer, const unsigned int length)
 
 		pipe = usb_sndbulkpipe(g_data->udev, g_data->bulk_tx_ep->bEndpointAddress);
 
-		usb_fill_bulk_urb(urb, g_data->udev, pipe, buf,
+		usb_fill_bulk_urb(g_data->urb[TX_ACL_URB], g_data->udev, pipe, buf,
 					length - 1, (usb_complete_t)btmtk_usb_tx_complete_meta,
 					(void *)g_data);
 
-		urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+		g_data->urb[TX_ACL_URB]->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-		usb_anchor_urb(urb, &g_data->bulk_out_anchor);
+		usb_anchor_urb(g_data->urb[TX_ACL_URB], &g_data->bulk_out_anchor);
 
-		err = usb_submit_urb(urb, GFP_KERNEL);
+		err = usb_submit_urb(g_data->urb[TX_ACL_URB], GFP_KERNEL);
 		if (err == 0)
 			err = length;
 		else
@@ -2317,11 +2361,7 @@ int btmtk_usb_send_data(const u8 *buffer, const unsigned int length)
 			BTUSB_ERR("%s: No isoc_tx_ep", __func__);
 			return -ENODEV;
 		}
-		urb = usb_alloc_urb(BTUSB_MAX_ISOC_FRAMES, GFP_KERNEL);
-		if (!urb) {
-			BTUSB_ERR("%s: No memory for SCO", __func__);
-			return -ENOMEM;
-		}
+
 		pipe = usb_sndisocpipe(g_data->udev, g_data->isoc_tx_ep->bEndpointAddress);
 		buf = kzalloc(send_data_len, GFP_KERNEL);
 		if (buf == NULL) {
@@ -2330,18 +2370,18 @@ int btmtk_usb_send_data(const u8 *buffer, const unsigned int length)
 			goto error_buffer;
 		}
 		memcpy(buf, buffer + 1, send_data_len);
-		usb_fill_int_urb(urb, g_data->udev, pipe, buf,
+		usb_fill_int_urb(g_data->urb[TX_SCO_URB], g_data->udev, pipe, buf,
 			send_data_len, (usb_complete_t)btmtk_usb_isoc_tx_complete,
 			(void *)g_data, g_data->isoc_tx_ep->bInterval);
 
-		urb->transfer_flags = URB_ISO_ASAP;
+		g_data->urb[TX_SCO_URB]->transfer_flags = URB_ISO_ASAP;
 
-		__fill_isoc_descriptor(urb, send_data_len,
+		__fill_isoc_descriptor(g_data->urb[TX_SCO_URB], send_data_len,
 			le16_to_cpu(g_data->isoc_tx_ep->wMaxPacketSize));
-		usb_anchor_urb(urb, &g_data->isoc_out_anchor);
+		usb_anchor_urb(g_data->urb[TX_SCO_URB], &g_data->isoc_out_anchor);
 
 		atomic_inc(&g_data->isoc_out_count);
-		err = usb_submit_urb(urb, GFP_KERNEL);
+		err = usb_submit_urb(g_data->urb[TX_SCO_URB], GFP_KERNEL);
 		if (err == 0) {
 			err = length;
 			BTUSB_DBG("%s: HCI_SCODATA_PKT end", __func__);
@@ -2356,20 +2396,22 @@ int btmtk_usb_send_data(const u8 *buffer, const unsigned int length)
 
 error_buffer:
 	if (err < 0) {
-		if (urb) {
-			if (buffer[0] == HCI_ACLDATA_PKT)
-				usb_free_coherent(g_data->udev, urb->transfer_buffer_length,
-						urb->transfer_buffer, urb->transfer_dma);
-			else if (buffer[0] == HCI_SCODATA_PKT)
-				kfree(urb->transfer_buffer);
-			kfree(urb->setup_packet);
-			usb_unanchor_urb(urb);
+		if (buffer[0] == HCI_ACLDATA_PKT) {
+			usb_free_coherent(g_data->udev,
+				g_data->urb[TX_ACL_URB]->transfer_buffer_length,
+				g_data->urb[TX_ACL_URB]->transfer_buffer,
+				g_data->urb[TX_ACL_URB]->transfer_dma);
+			kfree(g_data->urb[TX_ACL_URB]->setup_packet);
+			usb_unanchor_urb(g_data->urb[TX_ACL_URB]);
+		} else if (buffer[0] == HCI_SCODATA_PKT) {
+			kfree(g_data->urb[TX_SCO_URB]->transfer_buffer);
+			kfree(g_data->urb[TX_SCO_URB]->setup_packet);
+			usb_unanchor_urb(g_data->urb[TX_SCO_URB]);
 		}
 	} else {
 		usb_mark_last_busy(g_data->udev);
 	}
 
-	usb_free_urb(urb);
 	return err;
 }
 
@@ -2398,7 +2440,12 @@ static inline void btmtk_usb_woble_wake_unlock(struct btmtk_usb_data *data)
 static int btmtk_reboot_notify(struct notifier_block *nb,
 			unsigned long event, void *unused)
 {
-	BTUSB_INFO("%s: btmtk_reboot_notify(%x)", __func__, event);
+	BTUSB_INFO("%s: btmtk_reboot_notify(%lx)", __func__, event);
+
+	if (event == SYS_POWER_OFF) {
+		BTUSB_INFO("%s: set woble for standby", __func__);
+		btmtk_usb_standby();
+	}
 
 	if (event == SYS_RESTART)
 		btmtk_usb_standby();
@@ -2422,9 +2469,6 @@ static int btmtk_usb_BT_init(void)
 	int major = 0;
 	int majorfwlog = 0;
 	int major_sco = 0;
-#if SUPPORT_MI_WOBLE
-	int ret = 0;
-#endif
 
 	BTUSB_INFO("%s: devID %d, devID_fwlog %d, devID_sco %d", __func__, devID, devIDfwlog, devID_sco);
 
@@ -2515,37 +2559,33 @@ static int btmtk_usb_BT_init(void)
 		goto err1;
 	}
 
-	pBTDev = device_create(pBTClass, NULL, devID, NULL, "stpbt");
+	pBTDev = device_create(pBTClass, NULL, devID, NULL, "%s", "stpbt");
 	if (IS_ERR(pBTDev)) {
 		BTUSB_ERR("device create fail, error code(%ld)", PTR_ERR(pBTDev));
 		goto err2;
 	}
 
-#if SUPPORT_MI_WOBLE
-	ret = device_create_file(pBTDev, &dev_attr_rclist);
-	BTUSB_ERR("device_create_file rclist, ret = %d", ret);
-
-#if SUPPORT_MI_WOBLE_BEACON
-	ret = device_create_file(pBTDev, &dev_attr_beacon_pdu);
-	BTUSB_ERR("device_create_file beacon_pdu, ret = %d", ret);
-#endif
-
-#endif
-
-	pBTDevfwlog = device_create(pBTClass, NULL, devIDfwlog, NULL, "stpbtfwlog");
+	pBTDevfwlog = device_create(pBTClass, NULL,
+		devIDfwlog, NULL, "%s", "stpbtfwlog");
 	if (IS_ERR(pBTDevfwlog)) {
-		BTUSB_ERR("device(stpbtfwlog) create fail, error code(%ld)", PTR_ERR(pBTDevfwlog));
+		BTUSB_ERR("device(stpbtfwlog) create fail, error code(%ld)",
+			PTR_ERR(pBTDevfwlog));
 		goto err2;
 	}
 
-	pBTDev_sco = device_create(pBTClass, NULL, devID_sco, NULL, "stpbt_sco");
+	pBTDev_sco = device_create(pBTClass, NULL,
+		devID_sco, NULL, "%s", "stpbt_sco");
 	if (IS_ERR(pBTDev_sco)) {
-		BTUSB_ERR("device(stpbt_sco) create fail, error code(%ld)", PTR_ERR(pBTDev_sco));
+		BTUSB_ERR("device(stpbt_sco) create fail, error code(%ld)",
+			PTR_ERR(pBTDev_sco));
 		goto err2;
 	}
-	BTUSB_INFO("%s: BT_major %d, BT_majorfwlog %d", __func__, BT_major, BT_majorfwlog);
-	BTUSB_INFO("%s: devID %d, devIDfwlog %d", __func__, devID, devIDfwlog);
-	BTUSB_ERR("%s: BT_major_sco %d, devID_sco %d", __func__, BT_major_sco, devID_sco);
+	BTUSB_INFO("%s: BT_major %d, BT_majorfwlog %d",
+		__func__, BT_major, BT_majorfwlog);
+	BTUSB_INFO("%s: devID %d, devIDfwlog %d",
+		__func__, devID, devIDfwlog);
+	BTUSB_INFO("%s: BT_major_sco %d, devID_sco %d",
+		__func__, BT_major_sco, devID_sco);
 	g_devIDfwlog = devIDfwlog;
 	FOPS_MUTEX_LOCK();
 	btmtk_fops_set_state(BTMTK_FOPS_STATE_INIT);
@@ -2556,23 +2596,6 @@ static int btmtk_usb_BT_init(void)
 	init_waitqueue_head(&(fw_log_inq));
 	init_waitqueue_head(&(inq_isoc));
 	init_waitqueue_head(&(dump_wait_q));
-
-#if SUPPORT_MI_WOBLE
-	BTUSB_WARN("%s: MI doesn't use RegisterPdwncCallback", __func__);
-#else
-	/* register system power off callback function. */
-	do {
-		typedef void (*func_ptr) (int (*f) (void));
-		char *func_name = "RegisterPdwncCallback";
-		func_ptr pFunc = (func_ptr) btmtk_usb_kallsyms_lookup_name(func_name);
-
-		if (pFunc) {
-			BTUSB_INFO("%s: Register Pdwnc callback success.", __func__);
-			pFunc(&btmtk_usb_standby);
-		} else
-			BTUSB_WARN("%s: No Exported Func Found [%s], just skip!", __func__, func_name);
-	} while (0);
-#endif
 
 	BTUSB_INFO("%s: Register reboot_notifier callback success.", __func__);
 	register_reboot_notifier(&btmtk_reboot_notifier);
@@ -2587,15 +2610,22 @@ static int btmtk_usb_BT_init(void)
 	btmtk_usb_set_state(BTMTK_USB_STATE_DISCONNECT);
 	USB_MUTEX_UNLOCK();
 
-#ifdef CONFIG_MP_WAKEUP_SOURCE_SYSFS_STAT
+#if defined(CONFIG_MP_WAKEUP_SOURCE_SYSFS_STAT)
 	g_data->woble_ws = wakeup_source_register(NULL, "btmtk_woble_wakelock");
+#elif (defined(LINUX_OS) && (KERNEL_VERSION(5, 4, 0) > LINUX_VERSION_CODE)) \
+	|| \
+	(defined(ANDROID_OS) && (KERNEL_VERSION(4, 19, 0) > LINUX_VERSION_CODE))
+	g_data->woble_ws = wakeup_source_register("btmtk_woble_wakelock");
 #else
-	g_data->woble_ws = wakeup_source_register(NULL,"btmtk_woble_wakelock");
+	g_data->woble_ws = wakeup_source_register(NULL, "btmtk_woble_wakelock");
 #endif
 	spin_lock_init(&g_data->fwlog_lock);
 	skb_queue_head_init(&g_data->fwlog_queue);
 	spin_lock_init(&g_data->isoc_lock);
 	skb_queue_head_init(&g_data->isoc_in_queue);
+	spin_lock_init(&g_data->txlock);
+	/* init meta buffer */
+	spin_lock_init(&(g_data->metabuffer->spin_lock.lock));
 
 	BTUSB_INFO("%s: end", __func__);
 	return 0;
@@ -2659,14 +2689,6 @@ static void btmtk_usb_BT_exit(void)
 	}
 
 	if (pBTDev) {
-#if SUPPORT_MI_WOBLE
-		device_remove_file(pBTDev, &dev_attr_rclist);
-
-#if SUPPORT_MI_WOBLE_BEACON
-		device_remove_file(pBTDev, &dev_attr_beacon_pdu);
-#endif
-
-#endif
 		device_destroy(pBTClass, dev);
 		pBTDev = NULL;
 	}
@@ -2748,7 +2770,7 @@ static int btmtk_usb_handle_resume(void)
 		if (ret)
 			return WOBLE_FAIL;
 	} else {
-		/* radio on cmd with wobx_mode_disable, used when unify woble and legacy woble off */
+		/* radio on cmd with wobx_mode_disable, used when unify woble and leagacy woble off */
 		if ((is_mt7668(g_data) || is_mt7663(g_data)) && fstate == BTMTK_FOPS_STATE_OPENED) {
 			ret = btmtk_usb_send_leave_woble_suspend_cmd();
 			if (ret)
@@ -2812,63 +2834,22 @@ static int btmtk_usb_wait_until_event(u8 *wait_event, int wait_event_len, int to
 		btmtk_usb_dispatch_event(g_data->io_buf, len);
 	} while (time_before(jiffies, comp_event_timo));
 
-	BTUSB_ERR("%s: Get complete event fail %d", __func__, ret);
+	BTUSB_ERR("%s: Get compelete event fail %d", __func__, ret);
 	return ret;
 }
 
 static int btmtk_usb_set_Woble_APCF_filter_parameter(void)
 {
 	int ret = -1;
-#if SUPPORT_MI_WOBLE
-	int i = 0;
-	int rc_num = 0;
-	/*---filter parameter cmd---*/
-	u8 cmd_filter[] = { 0x57, 0xFD, 0x0A, 0x01, 0x00, 0x5B,
-				0x31, 0x00,/* (Broadcaster Address && local name && manufacture data) -->TV */
-				0x30, 0x00,/* (Broadcaster Address && local name && manufacture data) -->TV */
-				0x01, 0x80, 0x00 };
-
-	u8 cmd_apk_filter[] = { 0x57, 0xFD, 0x0A, 0x01, 0x00, 0x5A,
-				0x04, 0x00,/* UUID -->APK */
-				0x00, 0x00,/* UUID -->APK */
-				0x01, 0x80, 0x00 };
-#else
 	u8 cmd[] = { 0x57, 0xfd, 0x0a, 0x01, 0x00, 0x5a, 0x20, 0x00, 0x20, 0x00, 0x01, 0x80, 0x00 };
-#endif
 	u8 event_complete[] = { 0x0e, 0x07, 0x01, 0x57, 0xfd, 0x00, 0x01/*, 00, 63*/ };
 
 	BTUSB_INFO("%s: begin", __func__);
-	
-#if SUPPORT_MI_WOBLE
-	if (rc_white_list[0])
-		rc_num = strlen(rc_white_list) / 18;
-
-	BTUSB_INFO("%s: rc_num = %d", __func__, rc_num);
-	/* for RC filter */
-	for (i = 0; i < rc_num; i++) {
-		ret = btmtk_usb_send_hci_cmd(cmd_filter, sizeof(cmd_filter), event_complete, sizeof(event_complete));
-		if (ret < 0)
-			BTUSB_ERR("%s: RC filter end ret %d", __func__, ret);
-		else
-			ret = 0;
-
-		cmd_filter[5]++;/* set filter index */
-	}
-
-	/* for apk filter */
-	ret = btmtk_usb_send_hci_cmd(cmd_apk_filter, sizeof(cmd_apk_filter), event_complete, sizeof(event_complete));
-	if (ret < 0)
-		BTUSB_ERR("%s: APK filter end ret %d", __func__, ret);
-	else
-		ret = 0;
-
-#else
 	ret = btmtk_usb_send_hci_cmd(cmd, sizeof(cmd), event_complete, sizeof(event_complete));
 	if (ret < 0)
 		BTUSB_ERR("%s: end ret %d", __func__, ret);
 	else
 		ret = 0;
-#endif
 
 	BTUSB_INFO("%s: end ret=%d", __func__, ret);
 	return ret;
@@ -2911,204 +2892,6 @@ done:
 	return ret;
 }
 
-#if SUPPORT_MI_WOBLE
-static int btmtk_usb_str_to_hex(char in)
-{
-	if ((in >= 'A') && (in <= 'Z')) {
-		return (in-'A'+10);
-	} else if ((in >= 'a') && (in <= 'z')) {
-		return (in-'a'+10);
-	} else if ((in >= '0') && (in <= '9')) {
-		return (in-'0');
-	}
-
-	BTUSB_ERR("%s: error input %c", __func__, in);
-	return 0;
-}
-
-#if SUPPORT_MI_WOBLE_BEACON
-static int btmtk_usb_send_read_WIFIADDR_cmd(void)
-{
-	u8 cmd[] = { 0x6F, 0xFC, 0x0A, 0x01, 0x0D, 0x06, 0x00, 0x02, 0x02, 0x01, 0x00, 0x02, 0x00 };
-	u8 event[] = { 0xE4, 0x12, 0x02, 0x0D, 0x0E, 0x00, 0x02, 0x02, 0x01, 0x00/* xx, xx, xx, xx, 0x02, 0x00, xx, xx, 0x68, 0x76*/ };
-	int i;
-	int ret = -1;
-
-	BTUSB_INFO("%s: begin", __func__);
-	if (wifi_addr == NULL) {
-		BTUSB_ERR("%s: Incorrect g_data", __func__);
-		return -1;
-	}
-
-	for (i = 0; i < BD_ADDRESS_SIZE; i++) {
-		if (wifi_addr[i] != 0) {
-			ret = 0;
-			goto done;
-		}
-	}
-
-	ret = btmtk_usb_send_wmt_cmd(cmd, sizeof(cmd), event, sizeof(event), 100, 20, false);
-	/* get wifi addr failed */
-	if (ret < 0){
-		BTUSB_ERR("%s: got event fail (%d)", __func__, ret);
-		return ret;
-	}
-
-	if (ret >= 18) {
-		BTUSB_ERR("%s: got event(Len %d):", __func__, ret);
-
-		wifi_addr[0] = g_data->io_buf[10];
-		wifi_addr[1] = g_data->io_buf[11];
-		wifi_addr[2] = g_data->io_buf[12];
-		wifi_addr[3] = g_data->io_buf[13];
-		wifi_addr[4] = g_data->io_buf[16];
-		wifi_addr[5] = g_data->io_buf[17];
-
-		goto done;
-
-	} else {
-		BTUSB_WARN("%s: got unknown result (%d)", __func__, ret);
-		for (i = 0; i < ret && i < 64; i++)
-			pr_cont("%02X ", g_data->io_buf[i]);
-		pr_cont("\n");
-
-		return -1;
-	}
-
-done:
-	BTUSB_INFO("%s: Local WIFI ADDR: %02X:%02X:%02X:%02X:%02X:%02X", __func__,
-		wifi_addr[0], wifi_addr[1], wifi_addr[2],
-		wifi_addr[3], wifi_addr[4], wifi_addr[5]);
-
-	return 0;
-}
-
-/*set adv parameter*/
-static int btmtk_usb_set_ADV_para_cmd(void)
-{
-	int ret = -1;
-	u8 cmd[] = { 0x06, 0x20, 0x0f,
-				0x40, 0x01,/*adv interval min*/
-				0x40, 0x01,/*adv interval max*/
-				0x03, 0x00, 0x00,/*adv type, own addr type, peer addr type*/
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00,/*Empty addr*/
-				0x07, 0x00/*channel map, adv filter policy*/
-			};
-	u8 event[] = { 0x0e, 0x04, 0x01, 0x06, 0x20};
-
-	BTUSB_INFO("%s", __func__);
-	ret = btmtk_usb_send_hci_cmd(cmd, sizeof(cmd), event, sizeof(event));
-	if (ret < 0) {
-		BTUSB_ERR("%s: Got error %d", __func__, ret);
-		return ret;
-	}
-
-	return ret;
-}
-
-/*set adv data*/
-static int btmtk_usb_set_ADV_data_cmd(void)
-{
-	int ret = -1;
-	int j = 0;
-	int pos = 0;
-	unsigned char real_wifi_addr[2*BD_ADDRESS_SIZE+1];
-	u8 cmd[] = { 0x08, 0x20, 0x20, 0x13,
-				0x02, 0x01, 0x06,/*flags*/
-				0x0f, 0xff,/*len,type*/
-				0x8f, 0x03,/*company ID*/
-				0x0a, 0x10,/*len, type*/
-				0x42, 0x0c, 0x01,/*TV PID*/
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00,/*wifi addr,need to copy*/
-				0xec/*Power*/
-			};
-	u8 event[] = { 0x0e, 0x04, 0x01, 0x08, 0x20};
-
-	BTUSB_INFO("%s", __func__);
-
-	pr_cont("pdu is: ");
-	/* update pdu info */
-	for (pos = 0; pos < 19; pos++) {
-		/* transfer string to hex */
-		cmd[4+pos] = ((btmtk_usb_str_to_hex(adv_pdu[2*pos])) << 4) + btmtk_usb_str_to_hex(adv_pdu[2*pos+1]);
-		pr_cont("0x%X, ", cmd[4+pos]);
-	}
-	pr_cont("\n");
-	/*set real wifi addr to adv_pdu*/
-	sprintf(real_wifi_addr, "%02x%02x%02x%02x%02x%02x", wifi_addr[0], wifi_addr[1], wifi_addr[2],
-			wifi_addr[3], wifi_addr[4], wifi_addr[5]);
-	memcpy(adv_pdu + 24, real_wifi_addr, 2*BD_ADDRESS_SIZE);
-
-	memcpy(cmd + 16, wifi_addr, BD_ADDRESS_SIZE);/*Copy wifi address */
-	pr_cont("set adv data cmd is: ");
-	for(j=0;j<sizeof(cmd);j++){
-		pr_cont("0x%X ", cmd[j]);
-	}
-	pr_cont("\n");
-
-	ret = btmtk_usb_send_hci_cmd(cmd, sizeof(cmd), event, sizeof(event));
-	if (ret < 0) {
-		BTUSB_ERR("%s: Got error %d", __func__, ret);
-		return ret;
-	}
-
-	return ret;
-}
-
-/*enable or disable ADV*/
-static int btmtk_usb_set_ADV_enable_cmd(bool enable)
-{
-	int ret = -1;
-	u8 cmd[] = { 0x0a, 0x20, 0x01,
-				0x00/*enable flag, need to set*/
-			};
-	u8 event[] = { 0x0e, 0x04, 0x01, 0x0a, 0x20};
-
-	BTUSB_INFO("%s enable is %d", __func__,enable);
-
-	cmd[3] = enable;
-	ret = btmtk_usb_send_hci_cmd(cmd, sizeof(cmd), event, sizeof(event));
-	if (ret < 0) {
-		BTUSB_ERR("%s: Got error %d", __func__, ret);
-		return ret;
-	}
-
-	return ret;
-}
-
-
-static int btmtk_usb_send_BEACON_cmd(void)
-{
-	int ret = -1;
-
-	/*set adv parameter*/
-	ret = btmtk_usb_set_ADV_para_cmd();
-	if (ret < 0) {
-		BTUSB_ERR("%s: Set ADV Para fail: %d", __func__, ret);
-		return ret;
-	}
-
-	/*set adv data*/
-	ret = btmtk_usb_set_ADV_data_cmd();
-	if (ret < 0) {
-		BTUSB_ERR("%s: Set ADV Data fail: %d", __func__, ret);
-		return ret;
-	}
-
-	/*enable adv */
-	ret = btmtk_usb_set_ADV_enable_cmd(true);
-	if (ret < 0) {
-		BTUSB_ERR("%s: Enable ADV fail: %d", __func__, ret);
-		return ret;
-	}
-
-	return 0;
-}
-
-#endif
-
-#endif
-
 /**
  * Set APCF manufacturer data and filter parameter
  */
@@ -3116,42 +2899,11 @@ static int btmtk_usb_set_Woble_APCF(void)
 {
 	int ret = -1;
 	int i = 0;
-#if SUPPORT_MI_WOBLE
-	/*------Xiaomi pattern------*/
-	/*---local name cmd---*/
-	u8 cmd_name[] = { 0x57, 0xFD, 0x08, 0x05, 0x00, 0x5B,
-				0x4D, 0x49, 0x20, 0x52, 0x43 /*name*/
-				};
-	/*---manufacture data cmd---*/
-	u8 cmd_manufacture[] = { 0x57, 0xFD, 0x07, 0x06, 0x00, 0x5B,
-					0x00, 0x01,/* manufacture data */
-					0x00, 0xFF /* manufacture data mask */
-					};
-	/*---broadcaster address cmd---*/
-	u8 cmd_brd_address[] = { 0x57, 0xFD, 0x0A, 0x02, 0x00, 0x5B,
-					0x00, 0x00, 0x00, 0x00, 0x00, 0x00,/* RC address */
-					0x00/* public address */
-					};
-	int rc_num = 0;
-	int brd_addr_i = 0;
-	int pos = 0;
-	int addr = 0;
-	/*---UUID cmd --> for apk ---*/
-	u8 cmd_uuid[] = { 0x57, 0xFD, 0x23, 0x03, 0x00, 0x5A,
-				0x00, 0x01, 0x02, 0x01, 0x05, 0x03, 0xFF, 0x00, 0x01,
-				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* local address */
-				0x00,
-				0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, /* mask */
-				0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-				0xFF
-				};
-#else
-	u8 manufacture_data[] = { 0x57, 0xfd, 0x27, 0x06, 0x00, 0x5a,
+	u8 manufactur_data[] = { 0x57, 0xfd, 0x27, 0x06, 0x00, 0x5a,
 		0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00, 0x00, 0x00, 0x43, 0x52, 0x4B, 0x54, 0x4D,
 		0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 		0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-#endif
 	u8 event[] = { 0x0e, 0x07, 0x01, 0x57, 0xfd, 0x00, /* 0x06 00 63 */ };
 
 	BTUSB_INFO("%s: woble_setting_apcf[0].length %d",
@@ -3184,75 +2936,19 @@ static int btmtk_usb_set_Woble_APCF(void)
 			ret = btmtk_usb_send_hci_cmd(g_data->woble_setting_apcf[i].content,
 					g_data->woble_setting_apcf[i].length, event, sizeof(event));
 			if (ret < 0) {
-				BTUSB_ERR("%s: manufacture_data error ret %d", __func__, ret);
+				BTUSB_ERR("%s: manufactur_data error ret %d", __func__, ret);
 				return ret;
 			}
 		}
 	} else { /* use default */
-#if SUPPORT_MI_WOBLE
-		if (rc_white_list[0])
-			rc_num = strlen(rc_white_list) / 18;
-
-		for (i = 0; i < rc_num; i++) {
-				/*RC name filter */
-				ret = btmtk_usb_send_hci_cmd(cmd_name, sizeof(cmd_name), event, sizeof(event));
-			if (ret < 0) {
-				BTUSB_ERR("%s: name data error ret %d", __func__, ret);
-				return ret;
-			}
-			cmd_name[5]++; /* set RC name filter index */
-
-			/* manufacture data filter */
-			ret = btmtk_usb_send_hci_cmd(cmd_manufacture, sizeof(cmd_manufacture), event, sizeof(event));
-			if (ret < 0) {
-				BTUSB_ERR("%s: manufacture data error ret %d", __func__, ret);
-				return ret;
-			}
-			cmd_manufacture[5]++; /* set manufacture data filter index */
-
-			/* RC Address filter */
-			BTUSB_ERR("%s: size of white list is %d,rc num is %d,rc list is %s", __func__, strlen(rc_white_list), rc_num, rc_white_list);
-			/* send filter cmd for every RC address */
-			pr_cont("rc address is: ");
-			/* update RC address */
-			for (brd_addr_i = 0; brd_addr_i < 6; brd_addr_i++) {
-
-				pos = i * 18 + brd_addr_i * 3;
-
-				/* transfer string to hex */
-				addr = ((btmtk_usb_str_to_hex(rc_white_list[pos])) << 4) + btmtk_usb_str_to_hex(rc_white_list[pos+1]);
-
-				cmd_brd_address[11-brd_addr_i] = addr;
-				pr_cont("0x%X ", cmd_brd_address[11-brd_addr_i]);
-			}
-			pr_cont("\n");
-
-			ret = btmtk_usb_send_hci_cmd(cmd_brd_address, sizeof(cmd_brd_address), event, sizeof(event));
-			if (ret < 0) {
-				BTUSB_ERR("%s: send %d RC address data error ret %d", __func__, i+1, ret);
-				return ret;
-			}
-			cmd_brd_address[5]++;/* set RC Address filter index */
-
-		}
-
-		/* uuid filter */
-		memcpy(cmd_uuid + 15, g_data->bdaddr, BD_ADDRESS_SIZE);
-		ret = btmtk_usb_send_hci_cmd(cmd_uuid, sizeof(cmd_uuid), event, sizeof(event));
-		if (ret < 0) {
-			BTUSB_ERR("%s: uuid data error ret %d", __func__, ret);
-			return ret;
-		}
-#else
-		BTUSB_INFO("%s: use default manufacture data", __func__);
-		memcpy(manufacture_data + 9, g_data->bdaddr, BD_ADDRESS_SIZE);
+		BTUSB_INFO("%s: use default manufactur data", __func__);
+		memcpy(manufactur_data + 9, g_data->bdaddr, BD_ADDRESS_SIZE);
 		ret = btmtk_usb_send_hci_cmd(
-			manufacture_data, sizeof(manufacture_data), event, sizeof(event));
+			manufactur_data, sizeof(manufactur_data), event, sizeof(event));
 		if (ret < 0) {
-			BTUSB_ERR("%s: manufacture_data error ret %d", __func__, ret);
+			BTUSB_ERR("%s: manufactur_data error ret %d", __func__, ret);
 			return ret;
 		}
-#endif
 
 		ret = btmtk_usb_set_Woble_APCF_filter_parameter();
 	}
@@ -3307,11 +3003,6 @@ static int btmtk_usb_del_Woble_APCF_index(void)
 {
 	int ret = -1;
 	u8 cmd[] = { 0x57, 0xfd, 0x03, 0x01, 0x01, 0x5a };
-#if SUPPORT_MI_WOBLE
-	int i = 0;
-	int rc_num = 0;
-	u8 cmd_2[] = { 0x57, 0xfd, 0x03, 0x01, 0x01, 0x5b };
-#endif
 	u8 event[] = { 0x0e, 0x07, 0x01, 0x57, 0xfd, 0x00, 0x01, /* 00, 63 */ };
 
 	BTUSB_INFO("%s", __func__);
@@ -3320,22 +3011,6 @@ static int btmtk_usb_del_Woble_APCF_index(void)
 		BTUSB_ERR("%s: Got error %d", __func__, ret);
 		return ret;
 	}
-
-#if SUPPORT_MI_WOBLE
-	if (rc_white_list[0])
-		rc_num = strlen(rc_white_list) / 18;
-
-	for (i = 0; i < rc_num; i++) {
-		ret = btmtk_usb_send_hci_cmd(cmd_2, sizeof(cmd_2), event, sizeof(event));
-		if (ret < 0) {
-			BTUSB_ERR("%s: delete 2nd filter Got error %d", __func__, ret);
-			return ret;
-		}
-
-		cmd_2[5]++;/* set filter index */
-	}
-#endif
-
 	return 0;
 }
 
@@ -3374,115 +3049,21 @@ static int btmtk_usb_reset_power_on(void)
 static int btmtk_usb_send_unify_woble_suspend_cmd(void)
 {
 	int ret = 0;	/* if successful, 0 */
-#if SUPPORT_MI_WOBLE
-	int j = 0;
-	#if SUPPORT_MI_WOBLE_BEACON
-	u8 cmd_0[] = { 0xC9, 0xFC, 0x38, 0x01, 0x20,
-				0x02, 0x00, 0x01, /* apcf mode */
-				0x02, 0x01, 0x00, /* GPIO */
-				0x09, 0x10, 0x01, 0x00, 0x10, 0x00, 0x10, 0x00, 0x2c, 0x01,/*GPIO Setting,20ms * 300 = 6s*/
-				0x05, 0x24, 0xF0, 0x00, 0x32, 0x00, /* wobx scan parameter */
-				0x06, 0x40, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, /* APCF filter index */
-				0x03, 0x43, 0x40, 0x06, /* key timeout */
-				0x04, 0x46, 0x00, 0x00, 0x00, /*local address,need to copy */
-				0x09, 0x26, 0x20, 0x1c, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, /* terminate cmd: 4.5s */
-				0x05, 0x22, 0xF7, 0xFF, 0xFF, 0xFF, /* don't stop ADV */
-	};
-
-	#else
-	u8 cmd_0[] = { 0xC9, 0xFC, 0x32, 0x01, 0x20,
-				0x02, 0x00, 0x01, /* apcf mode */
-				0x02, 0x01, 0x00, /* GPIO */
-				0x09, 0x10, 0x01, 0x00, 0x10, 0x00, 0x10, 0x00, 0x2c, 0x01,/*GPIO Setting,20ms * 300 = 6s*/
-				0x05, 0x24, 0xF0, 0x00, 0x32, 0x00, /* wobx scan parameter */
-				0x06, 0x40, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, /* APCF filter index */
-				0x03, 0x43, 0x40, 0x06, /* key timeout */
-				0x04, 0x46, 0x00, 0x00, 0x00, /*local address,need to copy */
-				0x09, 0x26, 0x20, 0x1c, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, /* terminate cmd: 4.5s */
-	};
-	#endif
-	#if SUPPORT_MI_WOBLE_BEACON
-	u8 cmd_1[] = { 0xC9, 0xFC, 0x56, 0x01, 0x20,
-				0x02, 0x00, 0x01, /* apcf mode */
-				0x02, 0x01, 0x00, /* GPIO */
-				0x09, 0x10, 0x01, 0x00, 0x08, 0x00, 0x80, 0x00, 0x02, 0x00,/* GPIO Setting,5ms/bit, 80ms interval, repeat 3 times */
-				0x05, 0x24, 0xF0, 0x00, 0x32, 0x00, /* wobx scan parameter */
-				0x06, 0x40, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, /* APCF filter index */
-				0x04, 0x42, 0x00, 0x01, 0x02, /* manufacture data relaive pos 0, ker size 2 */
-				0x03, 0x43, 0x40, 0x06, /* key timeout */
-				0x04, 0x46, 0x00, 0x00, 0x00, /*local address,need to copy */
-				0x12, 0x48, 0x01, 0x00, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0xFE, /* key code 0x00 0x01, seq len = 16,seq data = 1111111 0000 0000 0 <--waveform direction */
-							   0xFE, 0x01, 0x00, 0x00, 0x10, 0x00, 0x4A, 0xFF, /* key code 0xFE 0x01, seq len = 16,seq data = 1111111 1010 0101 0 <--waveform direction */
-				0x09, 0x26, 0x20, 0x1c, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, /* terminate cmd: 4.5s */
-				0x05, 0x22, 0xF7, 0xFF, 0xFF, 0xFF, /* don't stop ADV */
-				0x05, 0x49, 0x00, 0x01, 0x00, 0x00, /* default key code */
-			};
-	#else
-	u8 cmd_1[] = { 0xC9, 0xFC, 0x50, 0x01, 0x20,
-				0x02, 0x00, 0x01, /* apcf mode */
-				0x02, 0x01, 0x00, /* GPIO */
-				0x09, 0x10, 0x01, 0x00, 0x08, 0x00, 0x80, 0x00, 0x02, 0x00,/* GPIO Setting,5ms/bit, 80ms interval, repeat 3 times */
-				0x05, 0x24, 0xF0, 0x00, 0x32, 0x00, /* wobx scan parameter */
-				0x06, 0x40, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, /* APCF filter index */
-				0x04, 0x42, 0x00, 0x01, 0x02, /* manufacture data relaive pos 0, ker size 2 */
-				0x03, 0x43, 0x40, 0x06, /* key timeout */
-				0x04, 0x46, 0x00, 0x00, 0x00, /*local address,need to copy */
-				0x12, 0x48, 0x01, 0x00, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0xFE, /* key code 0x00 0x01, seq len = 16,seq data = 1111111 0000 0000 0 <--waveform direction */
-							   0xFE, 0x01, 0x00, 0x00, 0x10, 0x00, 0x4A, 0xFF, /* key code 0xFE 0x01, seq len = 16,seq data = 1111111 1010 0101 0 <--waveform direction */
-				0x09, 0x26, 0x20, 0x1c, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, /* terminate cmd: 4.5s */
-				0x05, 0x49, 0x00, 0x01, 0x00, 0x00, /* default key code */
-			};
-	#endif
-#else
 	u8 cmd[] = { 0xC9, 0xFC, 0x14, 0x01, 0x20, 0x02, 0x00, 0x01,
 		0x02, 0x01, 0x00, 0x05, 0x10, 0x01, 0x00, 0x40, 0x06,
 		0x02, 0x40, 0x5A, 0x02, 0x41, 0x0F };
-#endif
-
 	u8 status[] = { 0x0F, 0x04, 0x00, 0x01, 0xC9, 0xFC };
 	u8 comp_event[] = { 0xE6, 0x02, 0x08, 0x00 };
 
 	BTUSB_DBG("%s: begin", __func__);
-#if SUPPORT_MI_WOBLE
-	switch (g_data->bt_cfg.unify_woble_type) {
-		case 0:/*legacy wakeup */
-			memcpy(cmd_0 + 40, g_data->bdaddr, BD_ADDRESS_SIZE - 3);/*Copy local address */
-			pr_cont("wobx cmd_0 is: ");
-			for(j=0;j<sizeof(cmd_0);j++){
-				pr_cont("0x%X ", cmd_0[j]);
-			}
-			pr_cont("\n");
-			ret = btmtk_usb_send_hci_cmd(cmd_0, sizeof(cmd_0), status, sizeof(status));
-			break;
-		case 1:/* waveform wakeup*/
-			memcpy(cmd_1 + 45, g_data->bdaddr, BD_ADDRESS_SIZE - 3);/*Copy local address */
-			pr_cont("wobx cmd_1 is: ");
-			for (j = 0; j < sizeof(cmd_1); j++) {
-				pr_cont("0x%X ", cmd_1[j]);
-			}
-			pr_cont("\n");
-			ret = btmtk_usb_send_hci_cmd(cmd_1, sizeof(cmd_1), status, sizeof(status));
-			break;
-		default:
-			BTUSB_ERR("%s: unify_woble_type unknown(%d)", __func__, g_data->bt_cfg.unify_woble_type);
-		}
-#else
 	ret = btmtk_usb_send_hci_cmd(cmd, sizeof(cmd), status, sizeof(status));
-#endif
-
 	if (ret < 0) {
 		BTUSB_ERR("%s: failed(%d)", __func__, ret);
 		return ret;
 	}
 
-#if SUPPORT_MI_WOBLE
-	ret = btmtk_usb_wait_until_event(comp_event, sizeof(comp_event),
-			WOBLE_SUSPEND_COMP_EVENT_TIMO, WOBLE_SUSPEND_EVENT_INTERVAL_TIMO, 1);
-#else
 	ret = btmtk_usb_wait_until_event(comp_event, sizeof(comp_event),
 			WOBLE_COMP_EVENT_TIMO, WOBLE_EVENT_INTERVAL_TIMO, 1);
-#endif
-
 	if (ret < 0)
 		BTUSB_ERR("%s: comp_event return error(%d)", __func__, ret);
 
@@ -3507,11 +3088,6 @@ static int btmtk_usb_send_leave_woble_suspend_cmd(void)
 			WOBLE_COMP_EVENT_TIMO, WOBLE_EVENT_INTERVAL_TIMO, 1);
 	if (ret < 0)
 		BTUSB_ERR("%s: comp_event return error(%d)", __func__, ret);
-
-#if SUPPORT_MI_WOBLE_BEACON
-	/*disable ADV*/
-	btmtk_usb_set_ADV_enable_cmd(false);
-#endif
 
 	return ret;
 }
@@ -3573,23 +3149,12 @@ static int btmtk_usb_handle_entering_WoBLE_state(void)
 			}
 		} while (0);
 
-#if SUPPORT_MI_WOBLE
-		/*disable ble scan fistly */
-		btmtk_usb_send_disable_ble_scan();
-#endif
-
 		ret = btmtk_usb_send_get_vendor_cap();
 		if (ret)
 			goto Finish;
 		ret = btmtk_usb_send_read_BDADDR_cmd();
 		if (ret)
 			goto Finish;
-		
-#if SUPPORT_MI_WOBLE_BEACON
-		/*set beacon cmd and do not check error now*/
-		btmtk_usb_send_BEACON_cmd();
-#endif
-
 		ret = btmtk_usb_set_Woble_APCF();
 		if (ret)
 			goto Finish;
@@ -3691,7 +3256,6 @@ static int btmtk_usb_load_rom_patch_7662(void)
 	s32 sent_len;
 	int ret = 0;
 	u16 total_checksum = 0;
-	struct urb *urb;
 	u32 patch_len = 0;
 	u32 cur_len = 0;
 	dma_addr_t data_dma;
@@ -3725,17 +3289,10 @@ load_patch_protect:
 
 	btmtk_usb_switch_iobase_7662(WLAN);
 
-	urb = usb_alloc_urb(0, GFP_KERNEL);
-
-	if (!urb) {
-		ret = -ENOMEM;
-		goto error0;
-	}
-
 	buf = usb_alloc_coherent(g_data->udev, UPLOAD_PATCH_UNIT, GFP_KERNEL, &data_dma);
 	if (!buf) {
 		ret = -ENOMEM;
-		goto error1;
+		goto error0;
 	}
 
 	pos = buf;
@@ -3750,7 +3307,7 @@ load_patch_protect:
 				 g_data->rom_patch_bin_file_name);
 
 		ret = -1;
-		goto error2;
+		goto error1;
 	}
 
 	tmp_str = g_data->rom_patch;
@@ -3764,7 +3321,7 @@ load_patch_protect:
 		BTUSB_INFO("%s: no need to load rom patch", __func__);
 		if (!is_mt7662T(g_data))
 			btmtk_usb_send_dummy_bulk_out_packet_7662();
-		goto error2;
+		goto error1;
 	}
 
 	tmp_str = g_data->rom_patch + 16;
@@ -3831,7 +3388,7 @@ load_patch_protect:
 
 			BTUSB_INFO("%s: sent_len = %d, cur_len = %d, phase = %d", __func__, sent_len, cur_len, phase);
 
-			usb_fill_bulk_urb(urb,
+			usb_fill_bulk_urb(g_data->urb[LOAD_PATCH_URB],
 					g_data->udev,
 					pipe,
 					buf,
@@ -3839,20 +3396,20 @@ load_patch_protect:
 					(usb_complete_t)btmtk_usb_load_rom_patch_complete,
 					&sent_to_mcu_done);
 
-			urb->transfer_dma = data_dma;
-			urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+			g_data->urb[LOAD_PATCH_URB]->transfer_dma = data_dma;
+			g_data->urb[LOAD_PATCH_URB]->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-			ret = usb_submit_urb(urb, GFP_KERNEL);
+			ret = usb_submit_urb(g_data->urb[LOAD_PATCH_URB], GFP_KERNEL);
 
 			if (ret)
-				goto error2;
+				goto error1;
 
 			if (!wait_for_completion_timeout
 				(&sent_to_mcu_done, msecs_to_jiffies(1000))) {
-				usb_kill_urb(urb);
+				usb_kill_urb(g_data->urb[LOAD_PATCH_URB]);
 				BTUSB_ERR("%s: upload rom_patch timeout", __func__);
 				ret = -ETIME;
-				goto error2;
+				goto error1;
 			}
 
 			cur_len += sent_len;
@@ -3877,7 +3434,7 @@ load_patch_protect:
 	if (total_checksum != btmtk_usb_get_crc_7662()) {
 		BTUSB_ERR("checksum fail!, local(0x%x) <> fw(0x%x)", total_checksum, btmtk_usb_get_crc_7662());
 		ret = -1;
-		goto error2;
+		goto error1;
 	}
 
 	/* send check rom patch result request */
@@ -3903,10 +3460,8 @@ load_patch_protect:
 	mdelay(1);
 	btmtk_usb_send_hci_set_tx_power_cmd_7662();
 
-error2:
-	usb_free_coherent(g_data->udev, UPLOAD_PATCH_UNIT, buf, data_dma);
 error1:
-	usb_free_urb(urb);
+	usb_free_coherent(g_data->udev, UPLOAD_PATCH_UNIT, buf, data_dma);
 error0:
 	btmtk_usb_io_write32_7662(SEMAPHORE_03, 0x1);
 	return ret;
@@ -4402,6 +3957,8 @@ static int btmtk_usb_load_rom_patch_7668(void)
 	BTUSB_INFO("%s: loading ILM rom patch...", __func__);
 	patch_len = load_sysram3 ? PATCH_LEN_ILM : (g_data->rom_patch_len - PATCH_INFO_SIZE);
 	ret = btmtk_usb_load_partial_rom_patch_7668(patch_len, PATCH_INFO_SIZE);
+	if (ret < 0)
+		goto patch_end;
 	BTUSB_INFO("%s: loading ILM rom patch... Done", __func__);
 
 	/* CHIP_RESET, ROM patch would be reactivated.
@@ -4431,7 +3988,6 @@ static int btmtk_usb_load_partial_rom_patch_7668(u32 patch_len, int offset)
 {
 	s32 sent_len;
 	int ret = 0;
-	struct urb *urb;
 	u32 cur_len = 0;
 	dma_addr_t data_dma;
 	struct completion sent_to_mcu_done;
@@ -4443,16 +3999,10 @@ static int btmtk_usb_load_partial_rom_patch_7668(u32 patch_len, int offset)
 
 	BTUSB_INFO("%s: begin", __func__);
 
-	urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!urb) {
-		ret = -ENOMEM;
-		goto error0;
-	}
-
 	buf = usb_alloc_coherent(g_data->udev, UPLOAD_PATCH_UNIT, GFP_KERNEL, &data_dma);
 	if (!buf) {
 		ret = -ENOMEM;
-		goto error1;
+		goto error0;
 	}
 
 	pos = buf;
@@ -4504,7 +4054,7 @@ static int btmtk_usb_load_partial_rom_patch_7668(u32 patch_len, int offset)
 			BTUSB_INFO("%s: sent_len = %d, cur_len = %d, phase = %d", __func__, sent_len,
 					cur_len, phase);
 
-			usb_fill_bulk_urb(urb,
+			usb_fill_bulk_urb(g_data->urb[LOAD_PATCH_URB],
 					g_data->udev,
 					pipe,
 					buf,
@@ -4512,22 +4062,22 @@ static int btmtk_usb_load_partial_rom_patch_7668(u32 patch_len, int offset)
 					(usb_complete_t)btmtk_usb_load_rom_patch_complete,
 					&sent_to_mcu_done);
 
-			urb->transfer_dma = data_dma;
-			urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+			g_data->urb[LOAD_PATCH_URB]->transfer_dma = data_dma;
+			g_data->urb[LOAD_PATCH_URB]->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-			status = usb_submit_urb(urb, GFP_KERNEL);
+			status = usb_submit_urb(g_data->urb[LOAD_PATCH_URB], GFP_KERNEL);
 			if (status) {
 				BTUSB_ERR("%s: submit urb failed (%d)", __func__, status);
 				ret = status;
-				goto error2;
+				goto error1;
 			}
 
 			if (!wait_for_completion_timeout
 					(&sent_to_mcu_done, msecs_to_jiffies(1000))) {
-				usb_kill_urb(urb);
+				usb_kill_urb(g_data->urb[LOAD_PATCH_URB]);
 				BTUSB_ERR("%s: upload rom_patch timeout", __func__);
 				ret = -ETIME;
-				goto error2;
+				goto error1;
 			}
 
 			cur_len += sent_len;
@@ -4535,17 +4085,15 @@ static int btmtk_usb_load_partial_rom_patch_7668(u32 patch_len, int offset)
 			mdelay(1);
 			ret = btmtk_usb_get_rom_patch_result();
 			if (ret < 0 || (ret == ROM_PATCH_FINISH && phase == PATCH_PHASE1))
-				goto error2;
+				goto error1;
 			mdelay(1);
 
 		} else {
 			break;
 		}
 	}
-error2:
-	usb_free_coherent(g_data->udev, UPLOAD_PATCH_UNIT, buf, data_dma);
 error1:
-	usb_free_urb(urb);
+	usb_free_coherent(g_data->udev, UPLOAD_PATCH_UNIT, buf, data_dma);
 error0:
 	BTUSB_INFO("btmtk_usb_load_partial_rom_patch end");
 	return ret;
@@ -4588,6 +4136,7 @@ static int btmtk_usb_send_wmt_power_on_cmd_7668(void)
 			return 0;
 		}
 	}
+
 
 	g_data->is_mt7668_dongle_state = BTMTK_USB_7668_DONGLE_STATE_POWERING_ON;
 	do {
@@ -4715,6 +4264,65 @@ static void btmtk_usb_chip_reset_func_deinit(void)
 	pf_resetFunc2 = NULL;
 }
 
+static void btmtk_usb_urb_transfer_buffer_init(void)
+{
+	g_data->urb_transfer_buff[LOAD_PATCH_URB] = NULL;
+	g_data->urb_transfer_buff[RX_INTR_URB] = NULL;
+	g_data->urb_transfer_buff[RX_BULK_URB] = NULL;
+	g_data->urb_transfer_buff[RX_ISOC_URB] = NULL;
+	g_data->urb_transfer_buff[TX_ACL_URB] = NULL;
+	g_data->urb_transfer_buff[TX_SCO_URB] = NULL;
+}
+
+static int btmtk_usb_urb_alloc(void)
+{
+	g_data->urb[LOAD_PATCH_URB] = usb_alloc_urb(0, GFP_KERNEL);
+	if (!g_data->urb[LOAD_PATCH_URB])
+		goto err;
+
+	g_data->urb[RX_INTR_URB] = usb_alloc_urb(0, GFP_KERNEL);
+	if (!g_data->urb[RX_INTR_URB])
+		goto err;
+
+	g_data->urb[RX_BULK_URB] = usb_alloc_urb(0, GFP_KERNEL);
+	if (!g_data->urb[RX_BULK_URB])
+		goto err;
+
+	g_data->urb[RX_ISOC_URB] = usb_alloc_urb(BTUSB_MAX_ISOC_FRAMES, GFP_KERNEL);
+	if (!g_data->urb[RX_ISOC_URB])
+		goto err;
+
+	g_data->urb[TX_ACL_URB] = usb_alloc_urb(0, GFP_KERNEL);
+	if (!g_data->urb[TX_ACL_URB])
+		goto err;
+
+	g_data->urb[TX_SCO_URB] = usb_alloc_urb(BTUSB_MAX_ISOC_FRAMES, GFP_KERNEL);
+	if (!g_data->urb[TX_SCO_URB])
+		goto err;
+
+	return 0;
+err:
+
+	usb_free_urb(g_data->urb[LOAD_PATCH_URB]);
+	usb_free_urb(g_data->urb[RX_INTR_URB]);
+	usb_free_urb(g_data->urb[RX_BULK_URB]);
+	usb_free_urb(g_data->urb[RX_ISOC_URB]);
+	usb_free_urb(g_data->urb[TX_ACL_URB]);
+	usb_free_urb(g_data->urb[TX_SCO_URB]);
+
+	return -1;
+}
+
+static void btmtk_usb_urb_free(void)
+{
+	usb_free_urb(g_data->urb[LOAD_PATCH_URB]);
+	usb_free_urb(g_data->urb[RX_INTR_URB]);
+	usb_free_urb(g_data->urb[RX_BULK_URB]);
+	usb_free_urb(g_data->urb[RX_ISOC_URB]);
+	usb_free_urb(g_data->urb[TX_ACL_URB]);
+	usb_free_urb(g_data->urb[TX_SCO_URB]);
+}
+
 static void btmtk_usb_cap_init(void)
 {
 #if SUPPORT_MT7662
@@ -4763,8 +4371,11 @@ static void btmtk_usb_cap_init(void)
 		 *  $$$$ : chip id
 		 *  % : fw version & 0xFF + 1 (in HEX)
 		 */
-		snprintf(g_data->rom_patch_bin_file_name, MAX_BIN_FILE_NAME_LEN, "mt%04x_patch_e%x_hdr.bin",
-				g_data->chip_id & 0xffff, (fw_version & 0x0ff) + 1);
+		(void)snprintf(g_data->rom_patch_bin_file_name,
+				MAX_BIN_FILE_NAME_LEN,
+				"mt%04x_patch_e%x_hdr.bin",
+				g_data->chip_id & 0xffff,
+				(fw_version & 0x0ff) + 1);
 		BTUSB_INFO("%s: rom patch file name is %s", __func__, g_data->rom_patch_bin_file_name);
 		g_data->rom_patch_len = 0;
 
@@ -4823,7 +4434,7 @@ static int btmtk_usb_load_rom_patch(void)
 static int btmtk_usb_send_woble_suspend_cmd(void)
 {
 	int ret = 0;	/* if successful, 0 */
-	/* radio off cmd with wobx_mode_disable, used when unify woble and legacy woble off */
+	/* radio off cmd with wobx_mode_disable, used when unify woble and leagacy woble off */
 	u8 radio_off_cmd[] = { 0xC9, 0xFC, 0x05, 0x01, 0x20, 0x02, 0x00, 0x00 };
 	u8 status_event[] = { 0x0F, 0x04, 0x00, 0x01, 0xC9, 0xFC };
 	u8 comp_event[] = { 0xE6, 0x02, 0x08, 0x00 };
@@ -5138,15 +4749,10 @@ resume_woble_done:
 		/* It's wobx debug log method. */
 		btmtk_usb_check_wobx_debug_log();
 
-#if SUPPORT_MI_WOBLE
-		g_data->is_mt7668_dongle_state = BTMTK_USB_7668_DONGLE_STATE_POWER_ON;
-#else/*MI may wakeup within fops open*/
 		if (fstate != BTMTK_FOPS_STATE_OPENED)
 			btmtk_usb_send_deinit_cmds();
 		else
 			g_data->is_mt7668_dongle_state = BTMTK_USB_7668_DONGLE_STATE_POWER_ON;
-#endif
-
 		BTUSB_INFO("%s: success", __func__);
 	}
 	return ret;
@@ -5190,21 +4796,18 @@ static void btmtk_usb_notify_wlan_remove_start(void)
 		return;
 	}
 
-	if (is_mt7663(g_data)) {
-		notify_wlan_remove_start_func_name = "BT_rst_L0_notify_WF_step1";
+	notify_wlan_remove_start_func_name = "BT_rst_L0_notify_WF_step1";
 
-		pnotify_wlan_remove_start_func =
-			(pnotify_wlan_remove_start)btmtk_usb_kallsyms_lookup_name
-				(notify_wlan_remove_start_func_name);
-	}
+	pnotify_wlan_remove_start_func =
+		(pnotify_wlan_remove_start)btmtk_usb_kallsyms_lookup_name
+			(notify_wlan_remove_start_func_name);
 
 	BTUSB_INFO(L0_RESET_TAG "%s\n", __func__);
 	/* void notify_wlan_remove_start(void) */
 	if (pnotify_wlan_remove_start_func) {
 		BTUSB_INFO("%s: do notify %s\n", __func__, notify_wlan_remove_start_func_name);
 		wlan_remove_done = 0;
-		if (is_mt7663(g_data))
-			pnotify_wlan_remove_start_func(0);
+		pnotify_wlan_remove_start_func(0);
 		wlan_status = WLAN_STATUS_CALL_REMOVE_START;
 	} else {
 		BTUSB_WARN("%s: do not get %s\n", __func__, notify_wlan_remove_start_func_name);
@@ -5226,17 +4829,10 @@ EXPORT_SYMBOL(btmtk_usb_notify_wlan_remove_end);
 
 int WF_rst_L0_notify_BT_step2(void)
 {
-	int ret = -1;
-
-	if (is_mt7663(g_data)) {
-		BTUSB_INFO(L0_RESET_TAG "%s begin\n", __func__);
-		btmtk_usb_notify_wlan_remove_end();
-		BTUSB_INFO(L0_RESET_TAG "%s done\n", __func__);
-		ret = 0;
-	} else {
-		BTUSB_ERR(L0_RESET_TAG "%s is not MT7663\n", __func__);
-	}
-	return ret;
+	BTUSB_INFO(L0_RESET_TAG "%s begin\n", __func__);
+	btmtk_usb_notify_wlan_remove_end();
+	BTUSB_INFO(L0_RESET_TAG "%s done\n", __func__);
+	return 0;
 }
 EXPORT_SYMBOL(WF_rst_L0_notify_BT_step2);
 
@@ -5255,6 +4851,9 @@ static void btmtk_usb_do_chip_reset(void)
 		g_data->reset_dongle = 1;
 		if (coredump_end)
 			coredump_end = 0;
+
+		if (coredump_start)
+			coredump_start = 0;
 
 		BTUSB_INFO("%s: set reset_dongle %d", __func__, g_data->reset_dongle);
 		btmtk_usb_toggle_rst_pin();
@@ -5326,6 +4925,9 @@ static int btmtk_usb_wait_dump_complete_thread(void *ptr)
 	int  i = 0;
 
 	BTUSB_INFO("%s: begin", __func__);
+
+	coredump_start = 0;
+	coredump_end = 0;
 
 	btmtk_usb_chip_reset_func_init();
 	set_freezable();
@@ -5418,11 +5020,11 @@ int btmtk_usb_bt_trigger_core_dump(int trigger_dump)
 
 	BTUSB_INFO("%s: trigger_dump %d\n", __func__, trigger_dump);
 	if (trigger_dump) {
-		if (is_mt7663(g_data))
-			wlan_status = WLAN_STATUS_CALL_REMOVE_START;
+		wlan_status = WLAN_STATUS_CALL_REMOVE_START;
 		ret = btmtk_usb_send_hci_cmd(coredump_cmd, sizeof(coredump_cmd), NULL, -1);
 		if (ret < 0) {
 			BTUSB_ERR("%s: error(%d)", __func__, ret);
+			btmtk_usb_stop_wait_dump_complete_thread();
 		} else {
 			BTUSB_INFO("%s: OK", __func__);
 			ret = 0;
@@ -5442,17 +5044,32 @@ int btmtk_usb_bt_trigger_core_dump(int trigger_dump)
 }
 EXPORT_SYMBOL(btmtk_usb_bt_trigger_core_dump);
 
-int WF_rst_L0_notify_BT_step1(int reserved)
+int WF_rst_L0_notify_BT_step1(int force_toggle_reset)
 {
 	int ret = -1;
 
-	if (is_mt7663(g_data)) {
-		BTUSB_INFO(L0_RESET_TAG "%s begin\n", __func__);
-		btmtk_usb_bt_trigger_core_dump(1);
-		BTUSB_INFO(L0_RESET_TAG "%s done\n", __func__);
-		ret = 0;
+	if (force_toggle_reset == true) {
+		if (is_mt7668(g_data) || is_mt7663(g_data)) {
+			BTUSB_INFO(L0_RESET_TAG "%s begin\n", __func__);
+			ret = btmtk_usb_bt_trigger_core_dump(false);
+			if (ret >= 0)
+				BTUSB_INFO(L0_RESET_TAG "%s done\n", __func__);
+			else
+				BTUSB_INFO(L0_RESET_TAG "%s fail\n", __func__);
+		} else {
+			BTUSB_WARN(L0_RESET_TAG "%s is not mt76xx\n", __func__);
+		}
 	} else {
-		BTUSB_ERR(L0_RESET_TAG "%s is not MT7663\n", __func__);
+		if (is_mt7668(g_data) || is_mt7663(g_data)) {
+			BTUSB_INFO(L0_RESET_TAG "%s begin\n", __func__);
+			ret = btmtk_usb_bt_trigger_core_dump(true);
+			if (ret >= 0)
+				BTUSB_INFO(L0_RESET_TAG "%s  done\n", __func__);
+			else
+				BTUSB_INFO(L0_RESET_TAG "%s  fail\n", __func__);
+		} else {
+			BTUSB_WARN(L0_RESET_TAG "%s is not mt76xx\n", __func__);
+		}
 	}
 	return ret;
 }
@@ -5470,7 +5087,7 @@ static void btmtk_usb_start_reset_dongle_progress(void)
 /*============================================================================*/
 #define ___________________________________________________Callback_Functions
 
-static void btmtk_usb_load_rom_patch_complete(const struct urb *urb)
+static void btmtk_usb_load_rom_patch_complete(struct urb *urb)
 {
 	struct completion *sent_to_mcu_done = (struct completion *)urb->context;
 
@@ -5494,6 +5111,10 @@ static void btmtk_usb_intr_complete(struct urb *urb)
 		intr_blocking_usb_warn++;
 		BTUSB_WARN("%s: urb %p urb->status %d count %d", __func__,
 			urb, urb->status, urb->actual_length);
+		if (urb->status == -ESHUTDOWN) {
+			btmtk_usb_do_chip_reset();
+			return;
+		}
 	} else if (urb->status == 0 && urb->actual_length != 0) {
 		intr_blocking_usb_warn = 0;
 	}
@@ -5570,7 +5191,7 @@ static void btmtk_usb_intr_complete(struct urb *urb)
 			BTUSB_WARN("%s: Queue is full !!", __func__);
 
 		if (length + g_data->metabuffer->write_p < META_BUFFER_SIZE) {
-			/* only one interrupt event, not be splitted */
+			/* only one interrupt event, not be splited */
 			if (leftHciEventSize == 0) {
 				/* copy event header: 0x04 */
 				g_data->metabuffer->buffer[g_data->metabuffer->write_p] = HCI_EVENT_PKT;
@@ -5583,10 +5204,10 @@ static void btmtk_usb_intr_complete(struct urb *urb)
 			BTUSB_DBG("%s: back to meta buffer head", __func__);
 			last_len = META_BUFFER_SIZE - g_data->metabuffer->write_p;
 
-			/* only one interrupt event, not be splitted */
+			/* only one interrupt event, not be splited */
 			if (leftHciEventSize == 0) {
 				if (last_len != 0) {
-					/* copy event header: 0x04 */
+					/* copy evnet header: 0x04 */
 					g_data->metabuffer->buffer[g_data->metabuffer->write_p] = HCI_EVENT_PKT;
 					g_data->metabuffer->write_p += 1;
 					last_len--;
@@ -5744,10 +5365,6 @@ static void btmtk_usb_bulk_in_complete(struct urb *urb)
 			/* print dump data to console */
 			if (dump_data_counter < 20)
 				BTUSB_INFO("btmtk_usb FW dump data (%d): %s", dump_data_counter, &buf[4]);
-
-			/* Save file by fifo */
-			if (g_data->bt_cfg.save_fw_dump_in_kernel)
-				btmtk_fifo_in(FIFO_COREDUMP, g_data->bt_fifo, (const void *)&buf[4], len);
 
 			if (buf[urb->actual_length - 6] == ' ' &&
 				buf[urb->actual_length - 5] == 'e' &&
@@ -5919,7 +5536,7 @@ bulk_intr_resub:
 	}
 }
 
-static void btmtk_usb_tx_complete_meta(const struct urb *urb)
+static void btmtk_usb_tx_complete_meta(struct urb *urb)
 {
 	if (g_data == NULL) {
 		BTUSB_ERR("%s: ERROR, g_data is NULL!", __func__);
@@ -5980,9 +5597,16 @@ static int btmtk_usb_send_get_vendor_cap(void)
 static int btmtk_usb_standby(void)
 {
 	int ret = 0;
+	int state = BTMTK_USB_STATE_UNKNOWN;
 
 	if (g_data == NULL) {
 		BTUSB_ERR("%s: ERROR, g_data is NULL!", __func__);
+		return -ENODEV;
+	}
+
+	state = btmtk_usb_get_state();
+	if (state == BTMTK_USB_STATE_DISCONNECT) {
+		BTUSB_ERR("%s, ERROR, usb disconnect state, return!", __func__);
 		return -ENODEV;
 	}
 
@@ -6105,7 +5729,6 @@ static int btmtk_usb_set_isoc_interface(bool close)
 
 static int btmtk_usb_submit_isoc_urb(void)
 {
-	struct urb *urb;
 	u8 *buf;
 	unsigned int pipe;
 	int err, size;
@@ -6123,45 +5746,44 @@ static int btmtk_usb_submit_isoc_urb(void)
 		return -ENODEV;
 	}
 
-	urb = usb_alloc_urb(BTUSB_MAX_ISOC_FRAMES, GFP_KERNEL);
-	if (!urb) {
-		BTUSB_ERR("%s: error 2", __func__);
-		return -ENOMEM;
-	}
-
 	size = le16_to_cpu(g_data->isoc_rx_ep->wMaxPacketSize) *
 		BTUSB_MAX_ISOC_FRAMES;
 
-	buf = kzalloc(size, GFP_KERNEL);
-	if (!buf) {
-		usb_free_urb(urb);
-		BTUSB_ERR("%s: error 3", __func__);
-		return -ENOMEM;
+	if (g_data->urb_transfer_buff[RX_ISOC_URB] == NULL) {
+		buf = kzalloc(size, GFP_KERNEL);
+		if (!buf) {
+			BTUSB_ERR("%s: error 3", __func__);
+			return -ENOMEM;
+		}
+		g_data->urb_transfer_buff[RX_ISOC_URB] = buf;
+	} else {
+		buf = g_data->urb_transfer_buff[RX_ISOC_URB];
 	}
 
 	/* For isoc in URB */
 	pipe = usb_rcvisocpipe(g_data->udev, g_data->isoc_rx_ep->bEndpointAddress);
 
-	usb_fill_int_urb(urb, g_data->udev, pipe, buf, size, (usb_complete_t)btmtk_usb_isoc_complete,
+	usb_fill_int_urb(g_data->urb[RX_ISOC_URB], g_data->udev,
+			pipe, buf, size,
+			(usb_complete_t)btmtk_usb_isoc_complete,
 			(void *)g_data, g_data->isoc_rx_ep->bInterval);
 
-	urb->transfer_flags = URB_FREE_BUFFER | URB_ISO_ASAP;
+	g_data->urb[RX_ISOC_URB]->transfer_flags = URB_FREE_BUFFER | URB_ISO_ASAP;
 
-	__fill_isoc_descriptor(urb, size,
+	__fill_isoc_descriptor(g_data->urb[RX_ISOC_URB], size,
 			le16_to_cpu(g_data->isoc_rx_ep->wMaxPacketSize));
 
-	usb_anchor_urb(urb, &g_data->isoc_in_anchor);
+	usb_anchor_urb(g_data->urb[RX_ISOC_URB], &g_data->isoc_in_anchor);
 
-	err = usb_submit_urb(urb, GFP_KERNEL);
+	err = usb_submit_urb(g_data->urb[RX_ISOC_URB], GFP_KERNEL);
 	if (err < 0) {
 		if (err != -EPERM && err != -ENODEV)
-			BTUSB_ERR("%s urb %p submission failed (%d)", __func__, urb, -err);
-		usb_unanchor_urb(urb);
+			BTUSB_ERR("%s urb %p submission failed (%d)", __func__, g_data->urb[RX_ISOC_URB], -err);
+		usb_unanchor_urb(g_data->urb[RX_ISOC_URB]);
 	} else {
 		g_data->isoc_urb_submitted = 1;
 	}
 
-	usb_free_urb(urb);
 	return err;
 }
 
@@ -6224,7 +5846,7 @@ isoc_resub:
 	BTUSB_DBG("%s End", __func__);
 }
 
-static void btmtk_usb_isoc_tx_complete(const struct urb *urb)
+static void btmtk_usb_isoc_tx_complete(struct urb *urb)
 {
 	if (urb->status != 0 || urb->actual_length == 0)
 		BTUSB_DBG("%s urb %p status %d count %d", __func__,
@@ -6250,7 +5872,8 @@ static ssize_t btmtk_usb_fops_write(struct file *file, const char __user *buf,
 	int fstate = BTMTK_FOPS_STATE_UNKNOWN;
 
 	if (g_data == NULL) {
-		BTUSB_ERR("%s: ERROR, g_data is NULL!", __func__);
+		BTUSB_ERR("%s: ERROR, g_data is NULL, (pid:%d)",
+			__func__, current->pid);
 		return -ENODEV;
 	}
 
@@ -6258,7 +5881,8 @@ static ssize_t btmtk_usb_fops_write(struct file *file, const char __user *buf,
 	fstate = btmtk_fops_get_state();
 	FOPS_MUTEX_UNLOCK();
 	if (fstate != BTMTK_FOPS_STATE_OPENED) {
-		BTUSB_WARN("%s: fops is not open yet(%d)!", __func__, fstate);
+		BTUSB_WARN("%s: fops is not open yet(%d), (pid:%d)",
+			__func__, fstate, current->pid);
 		return -ENODEV;
 	}
 
@@ -6266,18 +5890,21 @@ static ssize_t btmtk_usb_fops_write(struct file *file, const char __user *buf,
 	state = btmtk_usb_get_state();
 	USB_MUTEX_UNLOCK();
 	if (state != BTMTK_USB_STATE_WORKING) {
-		BTUSB_WARN("%s: current is in suspend/resume/standby (%d).", __func__, state);
-		msleep(3000);
+		BTUSB_WARN_LIMITTED("%s: current is (%d), (pid:%d)",
+			__func__, state, current->pid);
+		msleep(20);
 		return -EAGAIN;
 	}
 
 	if (need_reopen) {
-		BTUSB_WARN("%s: need_reopen (%d)!", __func__, need_reopen);
+		BTUSB_WARN("%s: need_reopen (%d), (pid:%d)",
+			__func__, need_reopen, current->pid);
 		return -EFAULT;
 	}
 
 	if (need_reset_stack) {
-		BTUSB_WARN("%s: need_reset_stack (%d)!", __func__, need_reset_stack);
+		BTUSB_WARN("%s: need_reset_stack (%d), (pid:%d)",
+			__func__, need_reset_stack, current->pid);
 		return -EFAULT;
 	}
 
@@ -6286,6 +5913,7 @@ static ssize_t btmtk_usb_fops_write(struct file *file, const char __user *buf,
 		return -EFAULT;
 	}
 
+	USB_OPS_MUTEX_LOCK();
 	/* semaphore mechanism, the waited process will sleep */
 	down(&g_data->wr_mtx);
 
@@ -6409,12 +6037,16 @@ static ssize_t btmtk_usb_fops_write(struct file *file, const char __user *buf,
 
 OUT:
 	up(&g_data->wr_mtx);
+	USB_OPS_MUTEX_UNLOCK();
 	return retval;
 }
 
 static ssize_t btmtk_usb_fops_writefwlog(struct file *filp, const char __user *buf,
 					size_t count, loff_t *f_pos)
 {
+#if (CFG_ENABLE_DEBUG_WRITE == 0)
+	return -ENODEV;
+#else
 	int i = 0, len = 0, ret = -1;
 	int state = BTMTK_USB_STATE_UNKNOWN;
 
@@ -6427,14 +6059,14 @@ static ssize_t btmtk_usb_fops_writefwlog(struct file *filp, const char __user *b
 	}
 
 	/* Command example : echo 01 be fc 01 05 > /dev/stpbtfwlog */
-	if (count > HCI_MAX_COMMAND_BUF_SIZE) {
+	if (count > HCI_MAX_COMMAND_BUF_SIZE - 1) {
 		BTUSB_ERR("%s: your command is larger than buffer length, count = %zd/%d",
 				__func__, count, HCI_MAX_COMMAND_BUF_SIZE);
 		return -ENOMEM;
 	}
 
 	memset(g_data->i_fwlog_buf, 0, HCI_MAX_COMMAND_BUF_SIZE);
-	memset(g_data->o_fwlog_buf, 0, HCI_MAX_COMMAND_SIZE);
+	memset(g_data->o_fwlog_buf, 0, HCI_MAX_COMMAND_SIZE + 16);
 	if (copy_from_user(g_data->i_fwlog_buf, buf, count) != 0) {
 		BTUSB_ERR("%s: Failed to copy data", __func__);
 		return -ENODATA;
@@ -6481,6 +6113,10 @@ static ssize_t btmtk_usb_fops_writefwlog(struct file *filp, const char __user *b
 			&& !(*pos >= 'a' && *pos <= 'f')) {
 			BTUSB_ERR("%s: There is an invalid input(%c)", __func__, *pos);
 			return -EINVAL;
+		} else if (len + 1 >= HCI_MAX_COMMAND_SIZE) {
+			BTUSB_ERR("%s: input data exceed max cmd length (%d)",
+				__func__, len);
+			return -EINVAL;
 		}
 		temp_str[0] = *pos;
 		temp_str[1] = *(pos + 1);
@@ -6505,6 +6141,9 @@ static ssize_t btmtk_usb_fops_writefwlog(struct file *filp, const char __user *b
 		return -ENOMEM;
 	}
 
+	/* When bperf = 1, pass cmd to userspace */
+	btmtk_usb_dispatch_data_bluetooth_kpi(g_data->o_fwlog_buf, len, 0);
+
 	/* send HCI command */
 	ret = usb_control_msg(g_data->udev, usb_sndctrlpipe(g_data->udev, 0),
 				0, DEVICE_CLASS_REQUEST_OUT, 0, 0,
@@ -6518,12 +6157,11 @@ static ssize_t btmtk_usb_fops_writefwlog(struct file *filp, const char __user *b
 err:
 	btmtk_usb_send_assert_cmd();
 	return -EIO;
-
+#endif
 }
 
 static ssize_t btmtk_usb_fops_read(struct file *file, char __user *buf, size_t count, loff_t *f_pos)
 {
-	int retval = 0;
 	int copyLen = 0;
 	int state = BTMTK_USB_STATE_UNKNOWN;
 	int fstate = BTMTK_FOPS_STATE_UNKNOWN;
@@ -6538,12 +6176,27 @@ static ssize_t btmtk_usb_fops_read(struct file *file, char __user *buf, size_t c
 	fstate = btmtk_fops_get_state();
 	FOPS_MUTEX_UNLOCK();
 	if (fstate != BTMTK_FOPS_STATE_OPENED) {
-		BTUSB_WARN("%s: fops is not open yet(%d)!", __func__, fstate);
+		BTUSB_WARN("%s: fops is not open yet(%d), (pid:%d)",
+			__func__, fstate, current->pid);
 		return -ENODEV;
 	}
 
+	/* no need to check state after need reset stack move to probe end*/
+#if 0
+	USB_MUTEX_LOCK();
+	state = btmtk_usb_get_state();
+	USB_MUTEX_UNLOCK();
+	if (state != BTMTK_USB_STATE_WORKING
+			&& state != BTMTK_USB_STATE_FW_DUMP) {
+		BTUSB_WARN("%s: current is not in working/dump state (%d).",
+			__func__, state);
+		return -EAGAIN;
+	}
+#endif
+
 	if (g_data == NULL) {
-		BTUSB_ERR("%s: ERROR, g_data is NULL!", __func__);
+		BTUSB_ERR("%s: ERROR, g_data is NULL, (pid:%d)",
+			__func__, current->pid);
 		return -ENODEV;
 	}
 	buffer = g_data->i_buf;
@@ -6558,7 +6211,7 @@ static ssize_t btmtk_usb_fops_read(struct file *file, char __user *buf, size_t c
 	USB_MUTEX_UNLOCK();
 	if (state == BTMTK_USB_STATE_SUSPEND_FW_DUMP) {
 		BTUSB_ERR("%s: current is BTMTK_USB_STATE_SUSPEND_FW_DUMP (%d).", __func__, state);
-		copyLen = -EAGAIN;
+		copyLen = 0;
 		goto OUT;
 	} else if (need_reset_stack) {
 		BTUSB_WARN("%s: need_reset_stack (%d)!", __func__, need_reset_stack);
@@ -6599,10 +6252,6 @@ static ssize_t btmtk_usb_fops_read(struct file *file, char __user *buf, size_t c
 		}
 		btmtk_usb_unlock_unsleepable_lock(&(g_data->metabuffer->spin_lock));
 		need_reopen = 1;
-	} else if (state != BTMTK_USB_STATE_WORKING && state != BTMTK_USB_STATE_FW_DUMP) {
-		BTUSB_ERR("%s: current is in suspend/resume (%d).", __func__, state);
-		copyLen = -EAGAIN;
-		goto OUT;
 	}
 
 	btmtk_usb_lock_unsleepable_lock(&(g_data->metabuffer->spin_lock));
@@ -6616,7 +6265,7 @@ static ssize_t btmtk_usb_fops_read(struct file *file, char __user *buf, size_t c
 		/* If nonblocking mode, return directly O_NONBLOCK is specified during open() */
 		if (file->f_flags & O_NONBLOCK) {
 			/* BTUSB_DBG("Non-blocking btmtk_usb_fops_read()"); */
-			retval = -EAGAIN;
+			copyLen = 0;
 			goto OUT;
 		}
 		wait_event(BT_wq, g_data->metabuffer->read_p != g_data->metabuffer->write_p);
@@ -6696,23 +6345,17 @@ static int btmtk_usb_send_init_cmds(void)
 		btmtk_usb_send_wmt_power_on_cmd_7668();
 		if (g_data->is_mt7668_dongle_state != BTMTK_USB_7668_DONGLE_STATE_POWER_ON) {
 			BTUSB_ERR("Power on MT7668 failed, reset it");
-			if (need_reset_stack == HW_ERR_NONE)
-				need_reset_stack = HW_ERR_CODE_POWER_ON;
 			btmtk_usb_start_reset_dongle_progress();
 			return -1;
 		}
 		if (btmtk_usb_send_hci_tci_set_sleep_cmd_7668() < 0) {
 			BTUSB_ERR("send sleep cmd on MT7668 failed, reset it");
-			if (need_reset_stack == HW_ERR_NONE)
-				need_reset_stack = HW_ERR_CODE_SET_SLEEP_CMD;
 			/*btmtk_usb_toggle_rst_pin();*/
 			return -1;
 		}
 
 		if (btmtk_usb_send_vendor_cfg() < 0) {
 			BTUSB_ERR("send vendor cmd on MT7663 failed, reset it");
-			if (need_reset_stack == HW_ERR_NONE)
-				need_reset_stack = HW_ERR_CODE_SET_SLEEP_CMD;
 			/*btmtk_usb_toggle_rst_pin();*/
 			return -1;
 		}
@@ -6740,8 +6383,6 @@ static int btmtk_usb_send_deinit_cmds(void)
 		btmtk_usb_send_wmt_power_off_cmd_7668();
 		if (g_data->is_mt7668_dongle_state != BTMTK_USB_7668_DONGLE_STATE_POWER_OFF) {
 			BTUSB_ERR("Power off MT7668 failed, reset it");
-			if (need_reset_stack == HW_ERR_NONE)
-				need_reset_stack = HW_ERR_CODE_POWER_OFF;
 			btmtk_usb_send_assert_cmd();
 			return -1;
 		}
@@ -6755,6 +6396,12 @@ static int btmtk_usb_fops_open(struct inode *inode, struct file *file)
 	int state = BTMTK_USB_STATE_UNKNOWN;
 	int fstate = BTMTK_FOPS_STATE_UNKNOWN;
 
+	BTUSB_INFO("%s: Mediatek Bluetooth USB driver ver %s",
+			__func__, VERSION);
+	BTUSB_INFO("%s: major %d minor %d (pid %d), probe counter: %d",
+			__func__, imajor(inode), iminor(inode),
+			current->pid, probe_counter);
+
 	if (g_data == NULL) {
 		BTUSB_ERR("%s: ERROR, g_data is NULL!", __func__);
 		return -ENODEV;
@@ -6764,7 +6411,7 @@ static int btmtk_usb_fops_open(struct inode *inode, struct file *file)
 	state = btmtk_usb_get_state();
 	USB_MUTEX_UNLOCK();
 	if (state == BTMTK_USB_STATE_INIT || state == BTMTK_USB_STATE_DISCONNECT) {
-		BTUSB_ERR("%s: usb state is incorrect, retry!", __func__);
+		BTUSB_ERR("%s: usb state is incorrest, retry!", __func__);
 		return -EAGAIN;
 	}
 
@@ -6772,7 +6419,12 @@ static int btmtk_usb_fops_open(struct inode *inode, struct file *file)
 	fstate = btmtk_fops_get_state();
 	FOPS_MUTEX_UNLOCK();
 	if (fstate == BTMTK_FOPS_STATE_OPENED) {
-		BTUSB_WARN("%s: fops opened!", __func__);
+		if (need_reopen) {
+			BTUSB_WARN_LIMITTED("%s: need do fops close firstly!",
+				__func__);
+			return -EAGAIN;
+		}
+		BTUSB_WARN_LIMITTED("%s: fops opened!", __func__);
 		return 0;
 	}
 
@@ -6786,10 +6438,6 @@ static int btmtk_usb_fops_open(struct inode *inode, struct file *file)
 			g_data->reset_progress, g_data->reset_dongle);
 		return -EAGAIN;
 	}
-
-	BTUSB_INFO("%s: Mediatek Bluetooth USB driver ver %s", __func__, VERSION);
-	BTUSB_INFO("%s: major %d minor %d (pid %d), probe counter: %d",
-			__func__, imajor(inode), iminor(inode), current->pid, probe_counter);
 
 	if (current->pid == 1) {
 		BTUSB_WARN("%s: return 0", __func__);
@@ -6817,13 +6465,6 @@ static int btmtk_usb_fops_open(struct inode *inode, struct file *file)
 		return -EAGAIN;
 	}
 
-#if SUPPORT_MI_WOBLE
-	BTUSB_WARN("%s: mt7668_dongle_state(%d).", __func__, g_data->is_mt7668_dongle_state);
-	if (g_data->is_mt7668_dongle_state == BTMTK_USB_7668_DONGLE_STATE_WOBLE) {
-		if (is_support_unify_woble(g_data))
-			btmtk_usb_unify_woble_wake_up();
-	} else
-#endif
 	if (btmtk_usb_send_init_cmds()) {
 		msleep(RESET_PIN_SET_LOW_TIME + 10);	/* wait chip reset */
 		return -EAGAIN;
@@ -6847,6 +6488,7 @@ static int btmtk_usb_fops_open(struct inode *inode, struct file *file)
 	btmtk_fops_set_state(BTMTK_FOPS_STATE_OPENED);
 	FOPS_MUTEX_UNLOCK();
 	need_reopen = 0;
+	need_reset_stack = HW_ERR_NONE;
 
 	BTUSB_INFO("%s: OK", __func__);
 
@@ -6858,6 +6500,10 @@ static int btmtk_usb_fops_close(struct inode *inode, struct file *file)
 	int state = BTMTK_USB_STATE_UNKNOWN;
 	int fstate = BTMTK_FOPS_STATE_UNKNOWN;
 	int ret = 0;
+
+	BTUSB_INFO("%s: major %d minor %d (pid %d), probe:%d", __func__,
+			imajor(inode), iminor(inode),
+			current->pid, probe_counter);
 
 	if (g_data == NULL) {
 		BTUSB_ERR("%s: ERROR, g_data is NULL!", __func__);
@@ -6876,8 +6522,8 @@ static int btmtk_usb_fops_close(struct inode *inode, struct file *file)
 	FOPS_MUTEX_LOCK();
 	btmtk_fops_set_state(BTMTK_FOPS_STATE_CLOSING);
 	FOPS_MUTEX_UNLOCK();
-	BTUSB_INFO("%s: major %d minor %d (pid %d), probe:%d", __func__,
-			imajor(inode), iminor(inode), current->pid, probe_counter);
+
+	btmtk_usb_stop_traffic();
 
 	USB_MUTEX_LOCK();
 	state = btmtk_usb_get_state();
@@ -6893,7 +6539,12 @@ static int btmtk_usb_fops_close(struct inode *inode, struct file *file)
 		goto exit;
 	}
 
-	btmtk_usb_stop_traffic();
+	if (g_data->is_mt7668_dongle_state
+			!= BTMTK_USB_7668_DONGLE_STATE_POWER_ON) {
+		BTUSB_WARN("%s: dongle state(%d) return.", __func__,
+			g_data->is_mt7668_dongle_state);
+		goto exit;
+	}
 
 	if (g_data->bt_cfg.support_auto_picus == true) {
 		ret = btmtk_usb_picus_operation(false);
@@ -6903,28 +6554,24 @@ static int btmtk_usb_fops_close(struct inode *inode, struct file *file)
 		}
 	}
 
-#if SUPPORT_MI_WOBLE
-		btmtk_usb_unify_woble_suspend(g_data);
-#else
-		if (state != BTMTK_USB_STATE_STANDBY) {
-			ret = btmtk_usb_send_hci_reset_cmd();
-			if (ret < 0) {
-				BTUSB_ERR("%s: btmtk_usb_send_hci_reset_cmd failed", __func__);
-				goto exit;
-			}
-	
-			ret = btmtk_usb_send_deinit_cmds();
-			if (ret < 0) {
-				BTUSB_ERR("%s: btmtk_usb_send_deinit_cmds failed", __func__);
-				goto exit;
-			}
+	if (state != BTMTK_USB_STATE_STANDBY) {
+		ret = btmtk_usb_send_hci_reset_cmd();
+		if (ret < 0) {
+			BTUSB_ERR("%s: btmtk_usb_send_hci_reset_cmd failed", __func__);
+			goto exit;
 		}
-#endif
 
+		ret = btmtk_usb_send_deinit_cmds();
+		if (ret < 0) {
+			BTUSB_ERR("%s: btmtk_usb_send_deinit_cmds failed", __func__);
+			goto exit;
+		}
+	}
+
+exit:
 	/* keep receive picus acl data after send hci reset cmd to avoid result in hci reset event happen -110 case*/
 	btmtk_usb_stop_acl_traffic();
 
-exit:
 	btmtk_usb_lock_unsleepable_lock(&(g_data->metabuffer->spin_lock));
 	g_data->metabuffer->read_p = 0;
 	g_data->metabuffer->write_p = 0;
@@ -7004,7 +6651,7 @@ static ssize_t btmtk_usb_fops_readfwlog(struct file *filp, char __user *buf, siz
 	if (g_data == NULL)
 		return -ENODEV;
 
-	/* picus read a queue, it may occur performance issue */
+	/* picus read a queue, it may occur performace issue */
 	FWLOG_SPIN_LOCK(flags);
 	if (skb_queue_len(&g_data->fwlog_queue))
 		skb = skb_dequeue(&g_data->fwlog_queue);
@@ -7448,6 +7095,7 @@ static int btmtk_usb_probe(struct usb_interface *intf, const struct usb_device_i
 	int err = -1;
 
 	probe_counter++;
+	atomic_set(&doing_reset, BTMTK_RESET_DONE);
 
 	BTUSB_INFO("%s: begin", __func__);
 	BTUSB_INFO("========================================================");
@@ -7465,6 +7113,12 @@ static int btmtk_usb_probe(struct usb_interface *intf, const struct usb_device_i
 		btmtk_usb_set_state(BTMTK_USB_STATE_PROBE);
 	USB_MUTEX_UNLOCK();
 
+	if (btmtk_usb_urb_alloc() < 0) {
+		BTUSB_INFO("%s: alloc urb failed\n", __func__);
+		return -ENOMEM;
+	}
+
+	btmtk_usb_urb_transfer_buffer_init();
 	btmtk_usb_chip_reset_func_deinit();
 	BTUSB_INFO("%s: create btmtk_usb_wait_dump_complete_thread\n", __func__);
 	wait_dump_complete_tsk = kthread_run(btmtk_usb_wait_dump_complete_thread,
@@ -7532,10 +7186,6 @@ static int btmtk_usb_probe(struct usb_interface *intf, const struct usb_device_i
 	g_data->udev = interface_to_usbdev(intf);
 	g_data->intf = intf;
 
-	spin_lock_init(&g_data->txlock);
-	/* init meta buffer */
-	spin_lock_init(&(g_data->metabuffer->spin_lock.lock));
-
 	sema_init(&g_data->wr_mtx, 1);
 	sema_init(&g_data->rd_mtx, 1);
 	sema_init(&g_data->isoc_wr_mtx, 1);
@@ -7552,13 +7202,17 @@ static int btmtk_usb_probe(struct usb_interface *intf, const struct usb_device_i
 	init_usb_anchor(&g_data->isoc_in_anchor);
 	init_usb_anchor(&g_data->isoc_out_anchor);
 
+	btmtk_usb_lock_unsleepable_lock(&(g_data->metabuffer->spin_lock));
 	g_data->metabuffer->read_p = 0;
 	g_data->metabuffer->write_p = 0;
 	memset(g_data->metabuffer->buffer, 0, META_BUFFER_SIZE);
+	btmtk_usb_unlock_unsleepable_lock(&(g_data->metabuffer->spin_lock));
 
 	btmtk_usb_cap_init();
 
-	memcpy(g_data->bt_cfg_file_name, BT_CFG_NAME, sizeof(BT_CFG_NAME));
+	(void)snprintf(g_data->bt_cfg_file_name, MAX_BIN_FILE_NAME_LEN,
+			"%s_%x.%s", BT_CFG_NAME_PREFIX,
+			g_data->chip_id, BT_CFG_NAME_SUFFIX);
 
 	btmtk_usb_load_bt_cfg(g_data->bt_cfg_file_name, &g_data->udev->dev, g_data);
 
@@ -7579,17 +7233,6 @@ static int btmtk_usb_probe(struct usb_interface *intf, const struct usb_device_i
 
 		BTUSB_ERR("btmtk_usb_probe end Error 4");
 		return err;
-	}
-
-	if (g_data->bt_cfg.save_fw_dump_in_kernel) {
-		if (g_data->bt_fifo == NULL) {
-			g_data->bt_fifo = btmtk_fifo_init();
-			if (!g_data->bt_fifo) {
-				BTUSB_ERR("%s: alloc memory fail (g_data->bt_fifo)", __func__);
-				return -1;
-			}
-		}
-		btmtk_fifo_start(g_data->bt_fifo);
 	}
 
 	/* Interface numbers are hardcoded in the specification */
@@ -7614,23 +7257,11 @@ static int btmtk_usb_probe(struct usb_interface *intf, const struct usb_device_i
 	sco_handle = 0;
 	g_data->isoc_urb_submitted = 0;
 	memset(g_data->bdaddr, 0, BD_ADDRESS_SIZE);
-
-	
-#if SUPPORT_MI_WOBLE_BEACON
-	memset(wifi_addr, 0, BD_ADDRESS_SIZE);
-	btmtk_usb_send_read_WIFIADDR_cmd();
-#endif
-
 	if (is_support_unify_woble(g_data)) {
-#if SUPPORT_MI_WOBLE
-		BTUSB_INFO("MI does not use woble setting");
-#else
 		btmtk_usb_load_woble_setting(g_data->woble_setting_file_name,
 			&g_data->udev->dev,
 			&g_data->woble_setting_len,
 			g_data);
-#endif
-
 		if (need_reset_stack)
 			btmtk_usb_reset_power_on();
 	}
@@ -7663,6 +7294,28 @@ static int btmtk_usb_probe(struct usb_interface *intf, const struct usb_device_i
 	return 0;
 }
 
+static int btmtk_usb_L0_probe(struct usb_interface *intf,
+			const struct usb_device_id *id)
+{
+	int ret = 0;
+	/* Set flags/functions here to leave HW reset mark before probe. */
+
+	ret = btmtk_usb_probe(intf, id);
+	if (ret) {
+		BTUSB_ERR("btmtk_usb_L0_probe failed, ret %d", ret);
+		goto exit;
+	}
+
+	need_reset_stack = HW_ERR_CODE_CHIP_RESET;
+	BTUSB_INFO("need_reset_stack %d probe_ret %d", need_reset_stack, ret);
+	wake_up_interruptible(&inq);
+
+	btmtk_usb_L0_hook_new_probe(btmtk_usb_probe);
+
+exit:
+	return ret;
+}
+
 static void btmtk_usb_disconnect(struct usb_interface *intf)
 {
 	int state = BTMTK_USB_STATE_UNKNOWN;
@@ -7676,6 +7329,9 @@ static void btmtk_usb_disconnect(struct usb_interface *intf)
 
 	BTUSB_INFO("%s: begin", __func__);
 
+	g_data->meta_tx = 0;
+
+	USB_OPS_MUTEX_LOCK();
 	USB_MUTEX_LOCK();
 	state = btmtk_usb_get_state();
 	if (state == BTMTK_USB_STATE_SUSPEND || state == BTMTK_USB_STATE_SUSPEND_DISCONNECT) {
@@ -7703,7 +7359,9 @@ static void btmtk_usb_disconnect(struct usb_interface *intf)
 	FOPS_MUTEX_LOCK();
 	fstate = btmtk_fops_get_state();
 	FOPS_MUTEX_UNLOCK();
-	if (fstate == BTMTK_FOPS_STATE_OPENED || fstate == BTMTK_FOPS_STATE_CLOSING) {
+	if (atomic_read(&doing_reset) == BTMTK_RESET_DONE &&
+		(fstate == BTMTK_FOPS_STATE_OPENED
+			|| fstate == BTMTK_FOPS_STATE_CLOSING)) {
 		BTUSB_WARN("%s: fstate = %d , set need_reset_stack", __func__, fstate);
 		if (need_reset_stack == HW_ERR_NONE)
 			need_reset_stack = HW_ERR_CODE_USB_DISC;
@@ -7719,13 +7377,13 @@ static void btmtk_usb_disconnect(struct usb_interface *intf)
 	else if (g_data->isoc)
 		usb_driver_release_interface(&btmtk_usb_driver, g_data->isoc);
 
-	g_data->meta_tx = 0;
+	btmtk_usb_lock_unsleepable_lock(&(g_data->metabuffer->spin_lock));
 	g_data->metabuffer->read_p = 0;
 	g_data->metabuffer->write_p = 0;
+	btmtk_usb_unlock_unsleepable_lock(&(g_data->metabuffer->spin_lock));
 
 	cancel_work_sync(&g_data->waker);
 
-	btmtk_usb_free_fifo();
 	btmtk_usb_free_setting_file();
 	btmtk_usb_stop_wait_dump_complete_thread();
 
@@ -7733,30 +7391,24 @@ static void btmtk_usb_disconnect(struct usb_interface *intf)
 	g_data->reset_progress = 0;
 	wlan_status = WLAN_STATUS_DEFAULT;
 
-#if SUPPORT_MI_WOBLE
-	/*On MI, when disconnect, mean usb err occur*/
-	btmtk_usb_toggle_rst_pin();
-#endif
+	btmtk_usb_urb_free();
+
+	atomic_set(&doing_reset, BTMTK_RESET_DONE);
+	USB_OPS_MUTEX_UNLOCK();
 
 	BTUSB_INFO("%s: end", __func__);
 }
 
 static int btmtk_usb_suspend(struct usb_interface *intf, pm_message_t message)
 {
-	int ret = -1;
+	int ret = 0;
 	int fstate = BTMTK_FOPS_STATE_UNKNOWN;
-	
-#if SUPPORT_MI_WOBLE
-	/*for str when BT off*/
-	FOPS_MUTEX_LOCK();
-	fstate = btmtk_fops_get_state();
-	if (fstate != BTMTK_FOPS_STATE_OPENED) {
-		BTUSB_WARN("%s: fops is not open(%d)!, return", __func__, fstate);
-		FOPS_MUTEX_UNLOCK();
+
+	if (intf->cur_altsetting->desc.bInterfaceNumber != 0) {
+		BTUSB_INFO("%s, interface num is %d, do't do suspend!",
+			__func__, intf->cur_altsetting->desc.bInterfaceNumber);
 		return 0;
 	}
-	FOPS_MUTEX_UNLOCK();
-#endif
 
 	USB_MUTEX_LOCK();
 	btmtk_usb_set_state(BTMTK_USB_STATE_SUSPEND);
@@ -7801,17 +7453,11 @@ static int btmtk_usb_resume(struct usb_interface *intf)
 	int ret = 0;
 	int fstate = BTMTK_FOPS_STATE_UNKNOWN;
 
-#if SUPPORT_MI_WOBLE
-	/*for str when BT off*/
-	FOPS_MUTEX_LOCK();
-	fstate = btmtk_fops_get_state();
-	if (fstate != BTMTK_FOPS_STATE_OPENED) {
-		BTUSB_WARN("%s: fops is not open(%d)!, return", __func__, fstate);
-		FOPS_MUTEX_UNLOCK();
+	if (intf->cur_altsetting->desc.bInterfaceNumber != 0) {
+		BTUSB_INFO("%s, interface num is %d, do't do resume!",
+			__func__, intf->cur_altsetting->desc.bInterfaceNumber);
 		return 0;
 	}
-	FOPS_MUTEX_UNLOCK();
-#endif
 
 	g_data->suspend_count--;
 	if (g_data->suspend_count) {
@@ -7824,8 +7470,6 @@ static int btmtk_usb_resume(struct usb_interface *intf)
 	if ((is_mt7668(g_data) || is_mt7663(g_data))
 			&& g_data->is_mt7668_dongle_state == BTMTK_USB_7668_DONGLE_STATE_ERROR) {
 		BTUSB_INFO("%s: In BTMTK_USB_7668_DONGLE_STATE_ERROR(Could suspend caused), do assert", __func__);
-		if (need_reset_stack == HW_ERR_NONE)
-			need_reset_stack = HW_ERR_CODE_WOBLE;
 		btmtk_usb_send_assert_cmd();
 		return -EBADFD;
 	} else if ((is_mt7668(g_data) || is_mt7663(g_data))
@@ -7850,8 +7494,6 @@ static int btmtk_usb_resume(struct usb_interface *intf)
 		/* avoid rtc to to suspend again, do FW dump first */
 		btmtk_usb_woble_wake_lock(g_data);
 		BTUSB_ERR("%s: do assert", __func__);
-		if (need_reset_stack == HW_ERR_NONE)
-			need_reset_stack = HW_ERR_CODE_WOBLE;
 		btmtk_usb_send_assert_cmd();
 	}
 

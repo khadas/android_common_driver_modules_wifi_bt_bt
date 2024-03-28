@@ -34,12 +34,16 @@ ccflags-y += -Wno-unused-function
 ###############################################################################
 USB_MOD_NAME = btmtk_usb
 USB_CFILES := \
-	btmtk_usb_main.c \
-	btmtk_usb_fifo.c
+	btmtk_usb_main.c
+
+ifneq ($(TARGET_BUILD_VARIANT), user)
+	ccflags-y += -DCFG_ENABLE_DEBUG_WRITE=1
+else
+	ccflags-y += -DCFG_ENABLE_DEBUG_WRITE=0
+endif
+
 $(USB_MOD_NAME)-objs := $(USB_CFILES:.c=.o)
 obj-m := $(USB_MOD_NAME).o
-
-
 
 all : modules
 modules:

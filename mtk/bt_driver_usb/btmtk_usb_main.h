@@ -16,7 +16,6 @@
 #include <net/bluetooth/bluetooth.h>
 #include "btmtk_define.h"
 #include <linux/pm_wakeup.h>
-#include <linux/timer.h>
 
 #define BD_ADDRESS_SIZE 6
 
@@ -105,7 +104,6 @@ struct bt_cfg_struct {
 	bool	support_unify_woble;	/* support unify woble or not */
 	bool	support_legacy_woble;		/* support legacy woble or not */
 	bool	support_woble_by_eint;		/* support woble by eint or not */
-	bool	save_fw_dump_in_kernel;		/* save fw dump in kernel or not */
 	bool	support_dongle_reset;		/* support chip reset or not */
 	bool	support_full_fw_dump;		/* dump full fw coredump or not */
 	bool	support_woble_wakelock;		/* support when woble error, do wakelock or not */
@@ -119,6 +117,17 @@ struct bt_cfg_struct {
 	char	*fw_dump_file_name;
 	struct fw_cfg_struct wmt_cmd[WMT_CMD_COUNT];
 	struct fw_cfg_struct vendor_cmd[VENDOR_CMD_COUNT];
+};
+
+enum {
+	LOAD_PATCH_URB,
+	RX_INTR_URB,
+	RX_BULK_URB,
+	RX_ISOC_URB,
+	TX_ACL_URB,
+	TX_SCO_URB,
+
+	URB_NUM
 };
 
 struct btmtk_usb_data {
@@ -135,6 +144,8 @@ struct btmtk_usb_data {
 	struct usb_anchor	bulk_out_anchor;/* bulk out */
 	struct usb_anchor	isoc_in_anchor;	/* isoc in */
 	struct usb_anchor	isoc_out_anchor;/* isoc out */
+	struct urb		*urb[URB_NUM];
+	unsigned char		*urb_transfer_buff[URB_NUM];
 	int			meta_tx;
 	spinlock_t		txlock;
 
@@ -203,7 +214,6 @@ struct btmtk_usb_data {
 	unsigned char		bulk_urb_submitted;
 	unsigned char		isoc_urb_submitted;
 	atomic_t		isoc_out_count;
-	void			*bt_fifo;
 
 #if SUPPORT_MT7668 || SUPPORT_MT7663
 	unsigned char		is_mt7668_dongle_state;
@@ -275,14 +285,6 @@ static inline int is_mt7663(struct btmtk_usb_data *data)
 }
 #endif
 
-static inline void do_gettimeofday(struct timeval *tv)
-{
-    struct timespec now;
-
-    getnstimeofday(&now);
-    tv->tv_sec = now.tv_sec;
-    tv->tv_usec = now.tv_nsec / 1000;
-}
 
 /**
  * Extern functions
@@ -291,6 +293,5 @@ int btmtk_usb_send_data(const unsigned char *buffer, const unsigned int length);
 int btmtk_usb_meta_send_data(const unsigned char *buffer,
 		const unsigned int length);
 void btmtk_usb_toggle_rst_pin(void);
-void btmtk_do_gettimeofday(struct timeval *tv);
 struct btmtk_usb_data *btmtk_usb_get_data(void);
 #endif /* __BTMTK_USB_MAIN_H__ */

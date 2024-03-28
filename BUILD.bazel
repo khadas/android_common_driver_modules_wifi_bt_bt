@@ -11,6 +11,7 @@ kernel_module(
         ],
     ),
     outs = [
+        "btmtk_usb.ko",
         "rtk_btusb.ko",
         "sdio_bt.ko",
         "aml_bt.ko",

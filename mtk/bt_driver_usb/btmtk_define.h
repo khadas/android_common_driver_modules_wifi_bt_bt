@@ -53,6 +53,13 @@ extern u8 btmtk_log_lvl;
 #define BTUSB_DBG(fmt, ...)	 \
 	do { if (btmtk_log_lvl >= BTMTK_LOG_LEVEL_DEBUG) pr_warn("[btmtk_debug] "fmt"\n", ##__VA_ARGS__); } while (0)
 
+#define BTUSB_WARN_LIMITTED(fmt, ...)     \
+do {						\
+	if (btmtk_log_lvl >= BTMTK_LOG_LEVEL_WARNING)	\
+		printk_ratelimited(KERN_WARNING "[btmtk_limit] %s: "fmt"\n", \
+			__func__, ##__VA_ARGS__);	\
+} while (0)
+
 #define BTUSB_INFO_RAW(p, l, fmt, ...)							\
 		do {									\
 			if (btmtk_log_lvl >= BTMTK_LOG_LEVEL_INFO) {			\
@@ -103,13 +110,8 @@ extern u8 btmtk_log_lvl;
 /**
  * Timeout setting, mescs
  */
-#define USB_CTRL_IO_TIMO	300
+#define USB_CTRL_IO_TIMO	2000
 #define USB_INTR_MSG_TIMO	2000
-
-#if SUPPORT_MI_WOBLE
-#define WOBLE_SUSPEND_EVENT_INTERVAL_TIMO	3000
-#define WOBLE_SUSPEND_COMP_EVENT_TIMO		15000
-#endif
 
 #define WOBLE_EVENT_INTERVAL_TIMO	500
 #define WOBLE_COMP_EVENT_TIMO		5000
@@ -233,12 +235,13 @@ extern u8 btmtk_log_lvl;
 /* Backward compatibility */
 #define WOBLE_SETTING_FILE_NAME "woble_setting.bin"
 #define BT_CFG_NAME "bt.cfg"
+#define BT_CFG_NAME_PREFIX "bt"
+#define BT_CFG_NAME_SUFFIX "cfg"
 #define BT_UNIFY_WOBLE "SUPPORT_UNIFY_WOBLE"
 #define BT_UNIFY_WOBLE_TYPE "UNIFY_WOBLE_TYPE"
 #define BT_LEGACY_WOBLE "SUPPORT_LEGACY_WOBLE"
 #define BT_WOBLE_BY_EINT "SUPPORT_WOBLE_BY_EINT"
 #define BT_DONGLE_RESET_PIN "BT_DONGLE_RESET_GPIO_PIN"
-#define BT_SAVE_FW_DUMP_IN_KERNEL "SAVE_FW_DUMP_IN_KERNEL"
 #define BT_SYS_LOG_FILE "SYS_LOG_FILE_NAME"
 #define BT_FW_DUMP_FILE "FW_DUMP_FILE_NAME"
 #define BT_RESET_DONGLE "SUPPORT_DONGLE_RESET"
@@ -260,5 +263,10 @@ extern u8 btmtk_log_lvl;
 #define COMMAND_TIMED_OUT_ERROR_CODE (-110)
 
 #define PM_KEY_BTW (0x0015) /* Notify PM the unify woble type */
+
+#define BTMTK_RESET_DOING 1
+#define BTMTK_RESET_DONE 0
+
+#define META_TX_RETRY 40
 
 #endif /* __BTMTK_DEFINE_H__ */
