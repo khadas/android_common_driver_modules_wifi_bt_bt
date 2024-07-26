@@ -605,7 +605,7 @@ static int bt_aml_insmod(void)
     //if (amlbt_poweron == AML_SDIO_EN)
     {
         PRINT("BTAML SDIOBT version:%s\n", BT_AML_SDIOBT_VERSION);
-        PRINT("release commit: 3d6a27323fa878809e49158ae75cc2ef1979a4c2 2024-06-05\n");
+        PRINT("release base commit: 1d1e89a79672a47aee49afdd3e2b8e07e27ee489 2024-07-26\n");
         PRINT("++++++sdio bt driver insmod start.++++++\n");
         reg_config_complete = 0;
 
