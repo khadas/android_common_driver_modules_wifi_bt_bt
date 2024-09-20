@@ -42,19 +42,22 @@
 #endif
 #include "rtk_btusb.h"
 
-#define RTKBT_RELEASE_NAME "20240315_BT_ANDROID_14.0"
-#define VERSION "5.2.1"
+#define RTKBT_RELEASE_NAME "20240717_BT_ANDROID_14.0"
 
-#define SUSPEND_DW_FW 0
-#define SET_WAKEUP_DEVICE 0
-#define TV_FW_CONFIG 1
-
+#define OPT_SUSPEND_DW_FW 0
+#define OPT_SET_WAKEUP_DEVICE 0
+#define OPT_TV_FW_CONFIG 1
+#define OPT_FAKE_USB_DISCONNECT 0
 
 static spinlock_t queue_lock;
 static spinlock_t running_flag_lock;
 static volatile uint16_t    driver_state = 0;
 
-#if SUSPEND_DW_FW
+#if OPT_FAKE_USB_DISCONNECT
+static struct usb_interface *hold_intf = NULL;
+#endif
+
+#if OPT_SUSPEND_DW_FW
 static firmware_info *fw_info_4_suspend = NULL;
 #endif
 
@@ -177,7 +180,7 @@ static patch_info fw_patch_table[] =
     { 0x0BDA, 0xB85B, 0x8852, 0, 0, "mp_rtl8852bu_fw", "rtl8852bu_fw", "rtl8852bu_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_65_2K}, /*RTL8852B */
     { 0x0BDA, 0x4853, 0x8852, 0, 0, "mp_rtl8852bu_fw", "rtl8852bu_fw", "rtl8852bu_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_65_2K}, /*RTL8852B */
     { 0x13D3, 0x3570, 0x8852, 0, 0, "mp_rtl8852bu_fw", "rtl8852bu_fw", "rtl8852bu_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_65_2K}, /*RTL8852B */
-    { 0x0BDA, 0xB852, 0x8852, 0, 0, "mp_rtl8852btu_fw", "rtl8852btu_fw", "rtl8852btu_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_65_2K}, /*RTL8852B */
+    { 0x0BDA, 0xB852, 0x8852, 0, 0, "mp_rtl8852btu_fw", "rtl8852btu_fw", "rtl8852btu_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_159K}, /*RTL8852B */
 //RTL8852c
     { 0x0BDA, 0xC85A, 0x8852, 0, 0, "mp_rtl8852cu_fw", "rtl8852cu_fw", "rtl8852cu_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_78K}, /*RTL8852C */
     { 0x0BDA, 0xC85D, 0x8852, 0, 0, "mp_rtl8852cu_fw", "rtl8852cu_fw", "rtl8852cu_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_78K}, /*RTL8852C */
@@ -198,9 +201,11 @@ static patch_info fw_patch_table[] =
 //RTL8852BP
     { 0x0BDA, 0xA85C, 0x8852, 0, 0, "mp_rtl8852bpu_fw", "rtl8852bpu_fw", "rtl8852bpu_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_65_2K}, /*RTL8852BP */
     { 0x0BDA, 0xA850, 0x8852, 0, 0, "mp_rtl8852bpu_fw", "rtl8852bpu_fw", "rtl8852bpu_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_65_2K}, /*RTL8852BPE */
-//RTL8852DU
+//RTL8852D
     { 0x0BDA, 0xD85A, 0x8852, 0, 0, "mp_rtl8852du_fw", "rtl8852du_fw", "rtl8852du_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_131K}, /*RTL8852D */
-
+    { 0x0BDA, 0xD85B, 0x8852, 0, 0, "mp_rtl8852du_fw", "rtl8852du_fw", "rtl8852du_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_131K}, /*RTL8852DU */
+//RTL8922A
+    { 0x0BDA, 0x892A, 0x8922, 0, 0, "mp_rtl8922au_fw", "rtl8922au_fw", "rtl8922au_config", NULL, 0, CONFIG_MAC_OFFSET_GEN_4PLUS, MAX_PATCH_SIZE_143K}, /*RTL8922AU */
     /* NOTE: must append patch entries above the null entry */
     { 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, 0, 0, 0 }
 };
@@ -301,10 +306,10 @@ static inline void set_driver_state_value(uint16_t change_value)
     spin_unlock(&running_flag_lock);
 }
 
-#if SUSPEND_DW_FW
+#if OPT_SUSPEND_DW_FW
 static int download_suspend_patch(firmware_info *fw_info, int cached);
 #endif
-#if SET_WAKEUP_DEVICE
+#if OPT_SET_WAKEUP_DEVICE
 static void set_wakeup_device_from_conf(firmware_info *fw_info);
 int set_wakeup_device(firmware_info *fw_info, uint8_t *wakeup_bdaddr);
 #endif
@@ -1789,7 +1794,7 @@ static patch_info *get_fw_table_entry(struct usb_device *udev)
     return patch_entry;
 }
 
-#if SUSPEND_DW_FW
+#if OPT_SUSPEND_DW_FW
 static patch_info *get_suspend_fw_table_entry(struct usb_device *udev)
 {
     patch_info *patch_entry = fw_patch_table;
@@ -1856,9 +1861,8 @@ static struct rtk_epatch_entry *get_fw_patch_entry(struct rtk_epatch *epatch_inf
             coex_ver = p_entry->coex_version & 0xffff;
 
             RTKBT_INFO("BTCOEX:20%06d-0x%04x svn version:0x%08x fw version:0x%08x rtk_btusb version:%s Cut:%d, patch length:0x%04x, patch offset:0x%08x\n",
-                       \
-                       coex_date, coex_ver, p_entry->svn_version, p_entry->fw_version, VERSION, p_entry->chip_id,
-                       p_entry->patch_length, p_entry->start_offset);
+                       coex_date, coex_ver, p_entry->svn_version, p_entry->fw_version, RTKBT_RELEASE_NAME,
+                       p_entry->chip_id, p_entry->patch_length, p_entry->start_offset);
             break;
         }
     }
@@ -1992,7 +1996,7 @@ int check_fw_version(firmware_info *fw_info, bool resume_check)
     }
 }
 
-#if SET_WAKEUP_DEVICE
+#if OPT_SET_WAKEUP_DEVICE
 int set_wakeup_device(firmware_info *fw_info, uint8_t *wakeup_bdaddr)
 {
     struct rtk_eversion_evt *ever_evt;
@@ -2715,7 +2719,7 @@ fw_fail:
     }
 }
 
-#if SUSPEND_DW_FW
+#if OPT_SUSPEND_DW_FW
 static int load_suspend_firmware(firmware_info *fw_info, uint8_t **buff)
 {
     const struct firmware *fw, *cfg;
@@ -2979,7 +2983,7 @@ int get_firmware(firmware_info *fw_info, int cached)
     return 0;
 }
 
-#if SUSPEND_DW_FW
+#if OPT_SUSPEND_DW_FW
 static int get_suspend_firmware(firmware_info *fw_info, int cached)
 {
     patch_info *patch_entry = fw_info->patch_entry;
@@ -3166,7 +3170,7 @@ int download_patch(firmware_info *fw_info, int cached)
         goto end;
     }
 
-#if SUSPEND_DW_FW
+#if OPT_SUSPEND_DW_FW
     if (fw_info_4_suspend)
     {
         RTKBT_DBG("%s: get suspend fw first cached %d", __func__, cached);
@@ -3223,7 +3227,7 @@ end:
     return ret_val;
 }
 
-#if SUSPEND_DW_FW
+#if OPT_SUSPEND_DW_FW
 static int download_suspend_patch(firmware_info *fw_info, int cached)
 {
     int ret_val = 0;
@@ -3337,7 +3341,7 @@ error:
 }
 #endif
 
-#if SET_WAKEUP_DEVICE
+#if OPT_SET_WAKEUP_DEVICE
 static void set_wakeup_device_from_conf(firmware_info *fw_info)
 {
     uint8_t paired_wakeup_bdaddr[7];
@@ -3425,7 +3429,7 @@ firmware_info *firmware_info_init(struct usb_interface *intf)
     fw_info->req_para = fw_info->send_pkt + CMD_HDR_LEN;
     fw_info->rsp_para = fw_info->rcv_pkt + EVT_HDR_LEN + CMD_CMP_LEN;
 
-#if SUSPEND_DW_FW
+#if OPT_SUSPEND_DW_FW
     suspend_firmware_info_init(fw_info);
 #endif
 
@@ -3472,7 +3476,7 @@ void firmware_info_destroy(struct usb_interface *intf)
     kfree(fw_info->send_pkt);
     kfree(fw_info);
 
-#if SUSPEND_DW_FW
+#if OPT_SUSPEND_DW_FW
     if (!fw_info_4_suspend)
     {
         return;
@@ -3599,9 +3603,8 @@ static void btusb_intr_complete(struct urb *urb)
         }
     }
     /* Avoid suspend failed when usb_kill_urb */
-    else if ((urb->status == -ENOENT) || (urb->status == -EPROTO))
+    else if (urb->status == -ENOENT)
     {
-        RTKBT_ERR("%s: urb->status = %d", __func__, urb->status);
         return;
     }
 
@@ -4151,7 +4154,7 @@ static int snd_send_sco_frame(struct sk_buff *skb)
 {
     struct hci_dev *hdev = (struct hci_dev *) skb->dev;
 
-    if (!hdev && !test_bit(HCI_RUNNING, &hdev->flags))
+    if (!hdev || !test_bit(HCI_RUNNING, &hdev->flags))
     {
         return -EBUSY;
     }
@@ -4834,7 +4837,7 @@ int bt_reboot_notify(struct notifier_block *notifier, ulong pm_event, void *unus
 
     case SYS_HALT:
     case SYS_POWER_OFF:
-#if SUSPEND_DW_FW
+#if OPT_SUSPEND_DW_FW
         cancel_work_sync(&data->work);
 
         btusb_stop_traffic(data);
@@ -4852,7 +4855,7 @@ int bt_reboot_notify(struct notifier_block *notifier, ulong pm_event, void *unus
         }
 #endif
 
-#if SET_WAKEUP_DEVICE
+#if OPT_SET_WAKEUP_DEVICE
         set_wakeup_device_from_conf(fw_info_4_suspend);
 #endif
         RTKBT_DBG("%s:system halt or power off", __func__);
@@ -5273,6 +5276,25 @@ static int btusb_probe(struct usb_interface *intf, const struct usb_device_id *i
     RTKBT_DBG("%s: can wakeup = %x, may wakeup = %x", __func__,
               device_can_wakeup(&udev->dev), device_may_wakeup(&udev->dev));
 
+#if OPT_FAKE_USB_DISCONNECT
+    /* The solution to the trouble caused by the btusb_probe being called for unknown reason more than once.
+       The related buffer would be erased for safety.
+    */
+    RTKBT_INFO("%s: udev->descriptor.bcdUSB = 0x%02x", __func__, udev->descriptor.bcdUSB);
+    RTKBT_INFO("%s: usb_interface hold_intf %p", __func__, hold_intf);
+
+    if (hold_intf)
+    {
+        RTKBT_INFO("%s: The btusb_data has been configured, now erase it", __func__);
+        btusb_disconnect(hold_intf);
+        RTKBT_INFO("%s: The btusb_data has been erased successfully, now do the reconfiguration", __func__);
+    }
+    else
+    {
+        RTKBT_INFO("%s: The btusb_data is NULL, now do the configuration", __func__);
+    }
+#endif
+
     data = rtk_alloc(intf);
     if (!data)
     {
@@ -5283,12 +5305,8 @@ static int btusb_probe(struct usb_interface *intf, const struct usb_device_id *i
     {
         ep_desc = &intf->cur_altsetting->endpoint[i].desc;
 
-        if (!data->intr_ep && usb_endpoint_is_bulk_in(ep_desc) && (ep_desc->bEndpointAddress == 0x81)) {
-            data->intr_ep = ep_desc;
-            continue;
-        }
-
-        if (!data->intr_ep && usb_endpoint_is_int_in(ep_desc)) {
+        if (!data->intr_ep && usb_endpoint_is_int_in(ep_desc))
+        {
             data->intr_ep = ep_desc;
             continue;
         }
@@ -5401,6 +5419,12 @@ static int btusb_probe(struct usb_interface *intf, const struct usb_device_id *i
     }
 
     usb_set_intfdata(intf, data);
+
+#if OPT_FAKE_USB_DISCONNECT
+    RTKBT_INFO("%s: usb_set_intfdata success", __func__);
+    hold_intf = intf;
+    RTKBT_INFO("%s: hold_intf = intf success", __func__);
+#endif
 
 //#ifdef CONFIG_HAS_EARLYSUSPEND
 #if 0
@@ -5526,6 +5550,14 @@ static void btusb_disconnect(struct usb_interface *intf)
     rtk_free(data);
     data = NULL;
     set_driver_state_value(0);
+
+#if OPT_FAKE_USB_DISCONNECT
+    if (intf == hold_intf)
+    {
+        RTKBT_INFO("%s: usb_interface set hold_intf %p to NULL", __func__, hold_intf);
+        hold_intf = NULL;
+    }
+#endif
 }
 
 #ifdef CONFIG_PM
@@ -5542,7 +5574,7 @@ static int btusb_suspend(struct usb_interface *intf, pm_message_t message)
         return 0;
     }
 
-#if TV_FW_CONFIG
+#if OPT_TV_FW_CONFIG
 #else
     if (!test_bit(HCI_RUNNING, &data->hdev->flags))
     {
@@ -5576,7 +5608,7 @@ static int btusb_suspend(struct usb_interface *intf, pm_message_t message)
     mdelay(URB_CANCELING_DELAY_MS);
     usb_kill_anchored_urbs(&data->tx_anchor);
 
-#if SUSPEND_DW_FW
+#if OPT_SUSPEND_DW_FW
     if (fw_info_4_suspend)
     {
         download_suspend_patch(fw_info_4_suspend, 1);
@@ -5587,7 +5619,7 @@ static int btusb_suspend(struct usb_interface *intf, pm_message_t message)
     }
 #endif
 
-#if SET_WAKEUP_DEVICE
+#if OPT_SET_WAKEUP_DEVICE
     set_wakeup_device_from_conf(fw_info_4_suspend);
 #endif
 
@@ -5728,7 +5760,7 @@ static int __init btusb_init(void)
     int err;
 
     RTKBT_INFO("RTKBT_RELEASE_NAME: %s", RTKBT_RELEASE_NAME);
-    RTKBT_INFO("Realtek Bluetooth USB driver module init, version %s", VERSION);
+    RTKBT_INFO("Realtek Bluetooth USB driver module init, version %s", RTKBT_RELEASE_NAME);
     driver_state = 0;
 #if CONFIG_BLUEDROID
     err = btchr_init();
@@ -5778,5 +5810,5 @@ MODULE_PARM_DESC(mp_drv_mode, "0: NORMAL; 1: MP MODE");
 
 MODULE_AUTHOR("Realtek Corporation");
 MODULE_DESCRIPTION("Realtek Bluetooth USB driver version");
-MODULE_VERSION(VERSION);
+MODULE_VERSION(RTKBT_RELEASE_NAME);
 MODULE_LICENSE("GPL");

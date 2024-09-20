@@ -193,6 +193,7 @@ int mp_drv_mode = 0; /* 1 Mptool Fw; 0 Normal Fw */
 #define ROM_LMP_8822e               0x8822
 #define ROM_LMP_8852d               0x8852
 #define ROM_LMP_8852bt              0x8852
+#define ROM_LMP_8922a               0x8922
 
 /* signature: Realtek */
 const uint8_t RTK_EPATCH_SIGNATURE[8] = {0x52, 0x65, 0x61, 0x6C, 0x74, 0x65, 0x63, 0x68};
@@ -245,7 +246,7 @@ uint16_t project_id[] =
     ROM_LMP_NONE,
     ROM_LMP_8852d,//42 8852d
     ROM_LMP_NONE,
-    ROM_LMP_NONE,
+    ROM_LMP_8922a,//44 8922a
     ROM_LMP_NONE,
     ROM_LMP_NONE,
     ROM_LMP_8852bt,//47 8852bt
@@ -315,6 +316,8 @@ struct rtk_bt_vendor_config
     uint16_t data_len;
     struct rtk_bt_vendor_config_entry entry[0];
 } __attribute__((packed));
+
+static void btusb_disconnect(struct usb_interface *intf);
 
 /* Realtek - For rtk_btusb driver end */
 
@@ -681,10 +684,12 @@ static inline void hci_set_drvdata(struct hci_dev *hdev, void *data)
 #define MAX_PATCH_SIZE_40K            (1024*40 + 529)   //40K
 #define MAX_PATCH_SIZE_49_2K          (0xC4CF + 529)   //49.2K 8723f
 #define MAX_PATCH_SIZE_69_2K          (0x114D0 + 529)  //69.2K 8852a
-#define MAX_PATCH_SIZE_65_2K          (0x104D0 + 529)   //65.2K 8852b
+#define MAX_PATCH_SIZE_65_2K          (0x104D0 + 529)   //65.2K 8852b 8851b
 #define MAX_PATCH_SIZE_78K            (1024*78 + 529)   //78K  8852c
-#define MAX_PATCH_SIZE_145K           (0x24620)        //145K 8822E
-#define MAX_PATCH_SIZE_131K           (0x20D90)        //131K 8852D
+#define MAX_PATCH_SIZE_145K           (0x24620)        //145K 8822e
+#define MAX_PATCH_SIZE_131K           (0x20D90)        //131K 8852d
+#define MAX_PATCH_SIZE_143K           (0x23B21 + 529)  //142.8K 8922a
+#define MAX_PATCH_SIZE_159K           (0x27E00 + 529)  //159.5K 8852bt
 #define MAX_PATCH_SIZE_500K           (1024*500 + 529)  //500K 8761c_mx
 
 enum rtk_endpoit
